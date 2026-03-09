@@ -1,0 +1,1 @@
+"""Camera manager service placeholders."""

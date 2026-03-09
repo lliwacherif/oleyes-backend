@@ -1,0 +1,1 @@
+"""Vision engine service placeholders."""

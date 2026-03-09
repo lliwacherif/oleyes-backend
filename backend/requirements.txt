@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+httpx
+ultralytics
+opencv-python-headless
+python-dotenv
+yt-dlp
+numpy
+shapely
+lap
+sqlalchemy[asyncio]
+asyncpg
+psycopg[binary]
+bcrypt
+python-jose[cryptography]
