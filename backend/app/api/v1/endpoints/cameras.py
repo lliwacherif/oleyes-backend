@@ -1,10 +1,12 @@
+import cv2
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.deps import get_current_user
+from app.core.deps import get_current_user, get_current_user_from_query_token
 from app.models.user import User
 from app.models.camera import Camera
 
@@ -131,3 +133,58 @@ async def delete_camera(
     await db.delete(cam)
     await db.flush()
     return {"status": "deleted", "camera_id": camera_id}
+
+
+@router.get("/{camera_id}/live")
+async def camera_live(
+    camera_id: str,
+    current_user: User = Depends(get_current_user_from_query_token),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """Stream live MJPEG from the camera's RTSP URL. Auth via ?token=JWT."""
+    result = await db.execute(
+        select(Camera).where(
+            Camera.id == camera_id,
+            Camera.user_id == current_user.id,
+        )
+    )
+    cam = result.scalar_one_or_none()
+    if not cam:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Camera not found.",
+        )
+
+    cap = cv2.VideoCapture(cam.rtsp_url)
+    if not cap.isOpened():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to connect to camera stream.",
+        )
+
+    return StreamingResponse(
+        _mjpeg_generator(cap),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+def _mjpeg_generator(cap: cv2.VideoCapture):
+    """Yield MJPEG frames from an open VideoCapture."""
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            _, jpeg = cv2.imencode(".jpg", frame)
+            if jpeg is None:
+                continue
+            data = jpeg.tobytes()
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n"
+                + data
+                + b"\r\n"
+            )
+    finally:
+        cap.release()
