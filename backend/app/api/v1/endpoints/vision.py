@@ -38,6 +38,14 @@ class VisionYoutubeRequest(BaseModel):
     )
 
 
+class VisionRtspRequest(BaseModel):
+    rtsp_url: str = Field(..., min_length=1, description="RTSP stream URL")
+    scene_context: str | None = Field(
+        default=None,
+        description="Optional scene description to ground the AI analysis",
+    )
+
+
 @router.post("/detect-youtube", response_model=VisionJobResponse)
 async def start_youtube_detection(
     request: VisionYoutubeRequest,
@@ -67,6 +75,38 @@ async def start_youtube_detection(
         job_id=job_id,
         status="queued",
         detail="YOLOv11 job queued.",
+    )
+
+
+@router.post("/detect-rtsp", response_model=VisionJobResponse)
+async def start_rtsp_detection(
+    request: VisionRtspRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> VisionJobResponse:
+    scene_context = request.scene_context
+    if not scene_context:
+        result = await db.execute(
+            select(UserContext).where(UserContext.user_id == current_user.id)
+        )
+        ctx = result.scalar_one_or_none()
+        if ctx:
+            scene_context = ctx.context_text
+
+    job_id = str(uuid4())
+    _service.register_job(
+        job_id=job_id,
+        source_url=request.rtsp_url,
+        scene_context=scene_context,
+    )
+    background_tasks.add_task(
+        _service.start_job, job_id=job_id, source_url=request.rtsp_url
+    )
+    return VisionJobResponse(
+        job_id=job_id,
+        status="queued",
+        detail="RTSP detection job queued.",
     )
 
 
