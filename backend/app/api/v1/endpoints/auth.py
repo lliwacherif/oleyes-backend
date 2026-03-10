@@ -214,14 +214,16 @@ async def me(
             "business_name": ctx.business_name,
             "short_description": ctx.short_description,
             "number_of_locations": ctx.number_of_locations,
-            "estimated_number_of_cameras": ctx.estimated_number_of_cameras,
+            "estimated_cameras": ctx.estimated_number_of_cameras,
             "business_size": ctx.business_size,
             "camera_type": ctx.camera_type,
-            "theft_detection": ctx.theft_detection,
-            "suspicious_behavior_detection": ctx.suspicious_behavior_detection,
-            "loitering_detection": ctx.loitering_detection,
-            "employee_monitoring": ctx.employee_monitoring,
-            "customer_behavior_analytics": ctx.customer_behavior_analytics,
+            "security_priorities": {
+                "theft_detection": ctx.theft_detection,
+                "suspicious_behavior_detection": ctx.suspicious_behavior_detection,
+                "loitering_detection": ctx.loitering_detection,
+                "employee_monitoring": ctx.employee_monitoring,
+                "customer_behavior_analytics": ctx.customer_behavior_analytics,
+            },
             "environment_type": ctx.environment_type,
         }
         context_info = UserContextInfo(
