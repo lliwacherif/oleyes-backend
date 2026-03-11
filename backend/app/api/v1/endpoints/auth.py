@@ -286,3 +286,15 @@ async def me(
         created_at=current_user.created_at.isoformat(),
         context=context_info,
     )
+
+
+@router.delete("/me", status_code=status.HTTP_200_OK)
+async def delete_account(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Permanently delete the authenticated user's account and all related data."""
+    await db.delete(current_user)
+    await db.flush()
+    logger.info("User deleted: %s (%s)", current_user.username, current_user.email)
+    return {"status": "deleted", "user_id": str(current_user.id)}
