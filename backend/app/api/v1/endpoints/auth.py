@@ -3,7 +3,6 @@ Authentication endpoints: signup, login, token refresh, current user.
 """
 
 import logging
-import uuid as _uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from jose import JWTError
@@ -41,7 +40,6 @@ class LoginRequest(BaseModel):
 
 class GoogleSignInRequest(BaseModel):
     email: EmailStr
-    username: str | None = Field(None, max_length=100)
 
 
 class RefreshRequest(BaseModel):
@@ -49,7 +47,6 @@ class RefreshRequest(BaseModel):
 
 
 class GoogleSignInResponse(BaseModel):
-    is_new_user: bool
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
@@ -167,44 +164,31 @@ async def google_sign_in(
     request: GoogleSignInRequest,
     db: AsyncSession = Depends(get_db),
 ) -> GoogleSignInResponse:
-    """Google Sign-In: find or create user by email, return tokens."""
+    """Google Sign-In: look up user by email, return tokens if found."""
 
     result = await db.execute(
         select(User).where(User.email == request.email)
     )
     user = result.scalar_one_or_none()
-    is_new_user = False
 
-    if user:
-        if not user.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User account is deactivated.",
-            )
-        logger.info("Google sign-in (existing): %s", user.email)
-    else:
-        username = request.username or request.email.split("@")[0]
-        existing_username = await db.execute(
-            select(User).where(User.username == username)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No account found with this email.",
         )
-        if existing_username.scalar_one_or_none():
-            username = f"{username}_{_uuid.uuid4().hex[:6]}"
 
-        user = User(
-            email=request.email,
-            username=username,
-            hashed_password=hash_password(_uuid.uuid4().hex),
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is deactivated.",
         )
-        db.add(user)
-        await db.flush()
-        is_new_user = True
-        logger.info("Google sign-in (new user): %s (%s)", user.username, user.email)
+
+    logger.info("Google sign-in: %s", user.email)
 
     access_token = create_access_token(subject=str(user.id))
     refresh_token = create_refresh_token(subject=str(user.id))
 
     return GoogleSignInResponse(
-        is_new_user=is_new_user,
         access_token=access_token,
         refresh_token=refresh_token,
     )
