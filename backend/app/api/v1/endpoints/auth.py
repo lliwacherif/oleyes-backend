@@ -298,3 +298,111 @@ async def delete_account(
     await db.flush()
     logger.info("User deleted: %s (%s)", current_user.username, current_user.email)
     return {"status": "deleted", "user_id": str(current_user.id)}
+
+
+# ── Profile update schemas ────────────────────────────────────────────
+
+class UpdateProfileRequest(BaseModel):
+    username: str | None = Field(None, min_length=3, max_length=100)
+    email: EmailStr | None = None
+
+
+class UpdatePasswordRequest(BaseModel):
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=6, max_length=128)
+
+
+# ── Profile update endpoints ──────────────────────────────────────────
+
+@router.put("/me", response_model=UserResponse)
+async def update_profile(
+    request: UpdateProfileRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> UserResponse:
+    """Update the authenticated user's username and/or email."""
+    if request.username is None and request.email is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide at least one field to update (username or email).",
+        )
+
+    if request.email and request.email != current_user.email:
+        existing = await db.execute(
+            select(User).where(User.email == request.email)
+        )
+        if existing.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Email already taken.",
+            )
+        current_user.email = request.email
+
+    if request.username and request.username != current_user.username:
+        existing = await db.execute(
+            select(User).where(User.username == request.username)
+        )
+        if existing.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Username already taken.",
+            )
+        current_user.username = request.username
+
+    await db.flush()
+    logger.info("Profile updated: %s (%s)", current_user.username, current_user.email)
+
+    result = await db.execute(
+        select(UserContext).where(UserContext.user_id == current_user.id)
+    )
+    ctx = result.scalar_one_or_none()
+    context_info = UserContextInfo(has_context=False)
+    if ctx:
+        context_info = UserContextInfo(
+            has_context=True,
+            context_data={
+                "business_type": ctx.business_type,
+                "business_name": ctx.business_name,
+                "short_description": ctx.short_description,
+                "number_of_locations": ctx.number_of_locations,
+                "estimated_cameras": ctx.estimated_number_of_cameras,
+                "business_size": ctx.business_size,
+                "camera_type": ctx.camera_type,
+                "security_priorities": {
+                    "theft_detection": ctx.theft_detection,
+                    "suspicious_behavior_detection": ctx.suspicious_behavior_detection,
+                    "loitering_detection": ctx.loitering_detection,
+                    "employee_monitoring": ctx.employee_monitoring,
+                    "customer_behavior_analytics": ctx.customer_behavior_analytics,
+                },
+                "environment_type": ctx.environment_type,
+            },
+        )
+
+    return UserResponse(
+        id=str(current_user.id),
+        email=current_user.email,
+        username=current_user.username,
+        is_active=current_user.is_active,
+        created_at=current_user.created_at.isoformat(),
+        context=context_info,
+    )
+
+
+@router.put("/me/password", status_code=status.HTTP_200_OK)
+async def change_password(
+    request: UpdatePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Change the authenticated user's password."""
+    if not verify_password(request.current_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect.",
+        )
+
+    current_user.hashed_password = hash_password(request.new_password)
+    await db.flush()
+    logger.info("Password changed: %s", current_user.email)
+    return {"status": "password_changed"}
