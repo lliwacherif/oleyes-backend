@@ -85,3 +85,31 @@ async def create_chat(request: LLMChatRequest) -> LLMChatResponse:
     finally:
         await client.close()
     return LLMChatResponse(model=config.SCALWAY_MODEL or "unknown", content=content)
+
+
+class SimpleAskRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="User message")
+
+
+class SimpleAskResponse(BaseModel):
+    response: str
+
+
+@router.post("/ask", response_model=SimpleAskResponse)
+async def simple_ask(request: SimpleAskRequest) -> SimpleAskResponse:
+    """Simple text-in, text-out AI endpoint."""
+    client = ScalewayClient()
+    try:
+        content = await client.chat(
+            messages=[
+                {"role": "system", "content": config.SCALWAY_SYSTEM_PROMPT or ""},
+                {"role": "user", "content": request.text},
+            ],
+            max_tokens=512,
+            temperature=1.0,
+            top_p=1.0,
+            presence_penalty=0.0,
+        )
+    finally:
+        await client.close()
+    return SimpleAskResponse(response=content)
