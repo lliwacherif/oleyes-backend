@@ -46,6 +46,17 @@ class VisionRtspRequest(BaseModel):
     )
 
 
+class VisionRtmpRequest(BaseModel):
+    stream_key: str = Field(
+        ..., min_length=1,
+        description="MediaMTX stream key (e.g. 'cam1')",
+    )
+    scene_context: str | None = Field(
+        default=None,
+        description="Optional scene description to ground the AI analysis",
+    )
+
+
 @router.post("/detect-youtube", response_model=VisionJobResponse)
 async def start_youtube_detection(
     request: VisionYoutubeRequest,
@@ -107,6 +118,40 @@ async def start_rtsp_detection(
         job_id=job_id,
         status="queued",
         detail="RTSP detection job queued.",
+    )
+
+
+@router.post("/detect-rtmp", response_model=VisionJobResponse)
+async def start_rtmp_detection(
+    request: VisionRtmpRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> VisionJobResponse:
+    scene_context = request.scene_context
+    if not scene_context:
+        result = await db.execute(
+            select(SceneContext).where(SceneContext.user_id == current_user.id)
+        )
+        sc = result.scalar_one_or_none()
+        if sc and sc.refined_text:
+            scene_context = sc.refined_text
+
+    rtmp_url = f"rtmp://localhost:1935/live/{request.stream_key}"
+    job_id = str(uuid4())
+    _service.register_job(
+        job_id=job_id,
+        source_url=rtmp_url,
+        scene_context=scene_context,
+        stream_protocol="RTMP",
+    )
+    background_tasks.add_task(
+        _service.start_job, job_id=job_id, source_url=rtmp_url
+    )
+    return VisionJobResponse(
+        job_id=job_id,
+        status="queued",
+        detail=f"RTMP detection job queued (stream_key={request.stream_key}).",
     )
 
 

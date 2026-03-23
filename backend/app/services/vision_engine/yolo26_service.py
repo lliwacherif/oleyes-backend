@@ -8,12 +8,16 @@ from threading import Lock
 from threading import Event
 from time import time
 
+import cv2
 import httpx
 from ultralytics import YOLO
 from yt_dlp import YoutubeDL
 
 from app.core import config
 from app.services.vision_engine.logic_engine import AdvancedLogicEngine
+
+_RTMP_RECONNECT_DELAY = 2.0
+_RTMP_MAX_RECONNECTS = 10
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +82,12 @@ class Yolo26Service:
             logger.info("tracker_state_reset")
 
     def register_job(
-        self, *, job_id: str, source_url: str, scene_context: str | None = None
+        self,
+        *,
+        job_id: str,
+        source_url: str,
+        scene_context: str | None = None,
+        stream_protocol: str = "RTSP",
     ) -> None:
         self.stop_all_running()
         self._reset_tracker()
@@ -86,6 +95,7 @@ class Yolo26Service:
             "status": "queued",
             "source_url": source_url,
             "scene_context": scene_context,
+            "stream_protocol": stream_protocol,
             "result": None,
             "error": None,
             "frames": 0,
@@ -98,13 +108,13 @@ class Yolo26Service:
             "batch": [],
             "analysis_buffer": [],
             "analysis": None,
-            "risk_scores": deque(maxlen=5),  # rolling window for smoothing
+            "risk_scores": deque(maxlen=5),
             "stop_event": Event(),
         }
         if scene_context:
-            logger.info("📋 Job queued id=%s | 🎬 scene_context=\"%s\"", job_id, scene_context)
+            logger.info("Job queued id=%s proto=%s scene_context=\"%s\"", job_id, stream_protocol, scene_context)
         else:
-            logger.info("📋 Job queued id=%s | ⚠️ no scene context", job_id)
+            logger.info("Job queued id=%s proto=%s (no scene context)", job_id, stream_protocol)
 
     def _resolve_source(self, source_url: str) -> str:
         if "youtube.com" in source_url or "youtu.be" in source_url:
@@ -129,6 +139,18 @@ class Yolo26Service:
         job["status"] = "running"
         job["started_at"] = time()
         logger.info("yolo_job_started id=%s url=%s", job_id, source_url)
+
+        proto = str(job.get("stream_protocol", "RTSP")).upper()
+        if proto == "RTMP":
+            self._run_rtmp_job(job_id, job, source_url)
+        else:
+            self._run_stream_job(job_id, job, source_url)
+
+    # ------------------------------------------------------------------
+    # RTSP / YouTube job — uses model.track() which manages its own capture
+    # ------------------------------------------------------------------
+
+    def _run_stream_job(self, job_id: str, job: dict, source_url: str) -> None:
         try:
             if self._is_stopped(job):
                 job["status"] = "stopped"
@@ -154,80 +176,155 @@ class Yolo26Service:
                     job["status"] = "stopped"
                     job["finished_at"] = time()
                     break
-                job["frames"] = int(job.get("frames", 0)) + 1
-                frame_index = int(job["frames"])
-                boxes = getattr(result, "boxes", None)
-                detections = []
-                if boxes is not None and boxes.xyxy is not None:
-                    for box in boxes:
-                        cls_id = int(box.cls.item()) if box.cls is not None else -1
-                        conf = float(box.conf.item()) if box.conf is not None else 0.0
-                        xyxy = [float(x) for x in box.xyxy.tolist()[0]]
-                        track_id = int(box.id.item()) if getattr(box, "id", None) is not None else -1
-                        detections.append([cls_id, conf, *xyxy, track_id])
-                    job["detections"] = int(job.get("detections", 0)) + len(detections)
-
-                event = {
-                    "frame_index": frame_index,
-                    "timestamp": time(),
-                    "vectors": detections,
-                }
-                self._logic.update(
-                    {
-                        "frame_index": frame_index,
-                        "timestamp": time(),
-                        "vectors": detections,
-                    }
-                )
-                logic_summary = self._logic.generate_scene_summary()
-                job["logic"] = logic_summary
-                event["scene_text"] = logic_summary.get("scene_text", "")
-                batch = job.get("batch")
-                if isinstance(batch, list):
-                    batch.append(event)
-                stream_every = max(int(config.YOLO_STREAM_EVERY), 1)
-                if frame_index % stream_every == 0:
-                    job["event_id"] = int(job.get("event_id", 0)) + 1
-                    job["last_event"] = {"batch": list(batch or [])}
-                    self._maybe_analyze(job)
-                    if isinstance(batch, list):
-                        batch.clear()
-                    logger.info(
-                        "📹 frame=%s  detections=%d  batch_sent",
-                        frame_index,
-                        len(detections),
-                    )
-                log_every = max(int(config.YOLO_LOG_EVERY), 1)
-                if frame_index % log_every == 0:
-                    logger.debug(
-                        "yolo_frame=%s vectors=%s",
-                        frame_index,
-                        detections,
-                    )
-                job["last_update"] = time()
-            job["status"] = "done"
-            job["finished_at"] = time()
-            job["result"] = {
-                "frames": job["frames"],
-                "detections": job["detections"],
-            }
-            batch = job.get("batch")
-            if isinstance(batch, list) and batch:
-                job["event_id"] = int(job.get("event_id", 0)) + 1
-                job["last_event"] = {"batch": list(batch)}
-                self._maybe_analyze(job)
-                batch.clear()
-            logger.info(
-                "yolo_job_done id=%s frames=%s detections=%s",
-                job_id,
-                job["frames"],
-                job["detections"],
-            )
-        except Exception as exc:  # pragma: no cover - runtime dependency errors
+                self._process_result(job_id, job, result)
+            self._finalize_job(job_id, job)
+        except Exception as exc:
             job["status"] = "error"
             job["error"] = str(exc)
             job["finished_at"] = time()
             logger.exception("yolo_job_error id=%s error=%s", job_id, exc)
+
+    # ------------------------------------------------------------------
+    # RTMP job — manual cv2.VideoCapture loop with reconnection
+    # ------------------------------------------------------------------
+
+    def _run_rtmp_job(self, job_id: str, job: dict, source_url: str) -> None:
+        import time as _time
+        reconnects = 0
+        cap: cv2.VideoCapture | None = None
+
+        try:
+            while not self._is_stopped(job):
+                if cap is None or not cap.isOpened():
+                    if cap is not None:
+                        cap.release()
+                    if reconnects > 0:
+                        logger.info(
+                            "rtmp_reconnecting attempt=%d/%d url=%s",
+                            reconnects, _RTMP_MAX_RECONNECTS, source_url,
+                        )
+                        if reconnects > _RTMP_MAX_RECONNECTS:
+                            logger.warning("rtmp_max_reconnects url=%s", source_url)
+                            break
+                        _time.sleep(_RTMP_RECONNECT_DELAY)
+
+                    cap = cv2.VideoCapture(source_url, cv2.CAP_FFMPEG)
+                    if not cap.isOpened():
+                        cap.release()
+                        cap = None
+                        reconnects += 1
+                        logger.warning("rtmp_open_failed url=%s", source_url)
+                        continue
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    logger.info("rtmp_connected url=%s", source_url)
+                    self._reset_tracker()
+
+                ret, frame = cap.read()
+                if not ret:
+                    reconnects += 1
+                    if cap is not None:
+                        cap.release()
+                    cap = None
+                    continue
+
+                reconnects = 0
+                model = self._get_model()
+                results = model.track(
+                    source=frame,
+                    conf=config.YOLO_CONF,
+                    device=config.YOLO_DEVICE,
+                    verbose=False,
+                    max_det=config.YOLO_MAX_DETECTIONS,
+                    persist=True,
+                )
+                if results:
+                    self._process_result(job_id, job, results[0])
+
+            self._finalize_job(job_id, job)
+        except Exception as exc:
+            job["status"] = "error"
+            job["error"] = str(exc)
+            job["finished_at"] = time()
+            logger.exception("rtmp_job_error id=%s error=%s", job_id, exc)
+        finally:
+            if cap is not None:
+                cap.release()
+
+    # ------------------------------------------------------------------
+    # Shared helpers for frame processing
+    # ------------------------------------------------------------------
+
+    def _process_result(self, job_id: str, job: dict, result) -> None:
+        """Extract detections from a single YOLO result and update job state."""
+        job["frames"] = int(job.get("frames", 0)) + 1
+        frame_index = int(job["frames"])
+
+        boxes = getattr(result, "boxes", None)
+        detections = []
+        if boxes is not None and boxes.xyxy is not None:
+            for box in boxes:
+                cls_id = int(box.cls.item()) if box.cls is not None else -1
+                conf = float(box.conf.item()) if box.conf is not None else 0.0
+                xyxy = [float(x) for x in box.xyxy.tolist()[0]]
+                track_id = int(box.id.item()) if getattr(box, "id", None) is not None else -1
+                detections.append([cls_id, conf, *xyxy, track_id])
+            job["detections"] = int(job.get("detections", 0)) + len(detections)
+
+        event = {
+            "frame_index": frame_index,
+            "timestamp": time(),
+            "vectors": detections,
+        }
+        self._logic.update(
+            {
+                "frame_index": frame_index,
+                "timestamp": time(),
+                "vectors": detections,
+            }
+        )
+        logic_summary = self._logic.generate_scene_summary()
+        job["logic"] = logic_summary
+        event["scene_text"] = logic_summary.get("scene_text", "")
+
+        batch = job.get("batch")
+        if isinstance(batch, list):
+            batch.append(event)
+        stream_every = max(int(config.YOLO_STREAM_EVERY), 1)
+        if frame_index % stream_every == 0:
+            job["event_id"] = int(job.get("event_id", 0)) + 1
+            job["last_event"] = {"batch": list(batch or [])}
+            self._maybe_analyze(job)
+            if isinstance(batch, list):
+                batch.clear()
+            logger.info(
+                "frame=%s  detections=%d  batch_sent",
+                frame_index,
+                len(detections),
+            )
+        log_every = max(int(config.YOLO_LOG_EVERY), 1)
+        if frame_index % log_every == 0:
+            logger.debug("yolo_frame=%s vectors=%s", frame_index, detections)
+        job["last_update"] = time()
+
+    def _finalize_job(self, job_id: str, job: dict) -> None:
+        """Mark a job as done and flush any remaining batch."""
+        if job["status"] not in ("stopped", "error"):
+            job["status"] = "done"
+        job["finished_at"] = time()
+        job["result"] = {
+            "frames": job["frames"],
+            "detections": job["detections"],
+        }
+        batch = job.get("batch")
+        if isinstance(batch, list) and batch:
+            job["event_id"] = int(job.get("event_id", 0)) + 1
+            job["last_event"] = {"batch": list(batch)}
+            self._maybe_analyze(job)
+            batch.clear()
+        logger.info(
+            "yolo_job_done id=%s frames=%s detections=%s",
+            job_id, job["frames"], job["detections"],
+        )
 
     def get_status(self, job_id: str) -> str:
         job = self._jobs.get(job_id)

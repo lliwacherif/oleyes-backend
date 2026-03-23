@@ -30,6 +30,16 @@ class Camera(Base):
         Text,
         nullable=False,
     )
+    stream_protocol: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        default="RTSP",
+        server_default="RTSP",
+    )
+    stream_key: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
@@ -47,5 +57,16 @@ class Camera(Base):
         nullable=False,
     )
 
+    def effective_url(self) -> str:
+        """Return the actual URL to connect to.
+
+        For RTMP cameras the URL is built from the stream_key pointing
+        at the local MediaMTX instance.  For RTSP cameras the stored
+        rtsp_url is returned as-is.
+        """
+        if self.stream_protocol == "RTMP" and self.stream_key:
+            return f"rtmp://localhost:1935/live/{self.stream_key}"
+        return self.rtsp_url
+
     def __repr__(self) -> str:
-        return f"<Camera {self.name} user_id={self.user_id}>"
+        return f"<Camera {self.name} proto={self.stream_protocol} user_id={self.user_id}>"
