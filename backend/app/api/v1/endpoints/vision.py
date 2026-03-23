@@ -9,6 +9,7 @@ from pydantic import AnyHttpUrl, BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core import config
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.user import User
@@ -137,7 +138,8 @@ async def start_rtmp_detection(
         if sc and sc.refined_text:
             scene_context = sc.refined_text
 
-    rtmp_url = f"rtmp://localhost:1935/live/{request.stream_key}"
+    base = config.RTMP_BASE_URL.rstrip("/")
+    rtmp_url = f"{base}/{request.stream_key}"
     job_id = str(uuid4())
     _service.register_job(
         job_id=job_id,

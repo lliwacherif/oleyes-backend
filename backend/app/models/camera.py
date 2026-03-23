@@ -61,11 +61,13 @@ class Camera(Base):
         """Return the actual URL to connect to.
 
         For RTMP cameras the URL is built from the stream_key pointing
-        at the local MediaMTX instance.  For RTSP cameras the stored
-        rtsp_url is returned as-is.
+        at the MediaMTX instance (configured via RTMP_BASE_URL env var).
+        For RTSP cameras the stored rtsp_url is returned as-is.
         """
         if self.stream_protocol == "RTMP" and self.stream_key:
-            return f"rtmp://localhost:1935/live/{self.stream_key}"
+            from app.core import config
+            base = config.RTMP_BASE_URL.rstrip("/")
+            return f"{base}/{self.stream_key}"
         return self.rtsp_url
 
     def __repr__(self) -> str:

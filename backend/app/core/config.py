@@ -52,6 +52,9 @@ YOLO_STREAM_BUFFER = get_env("YOLO_STREAM_BUFFER", "false").lower() == "true"
 
 RTSP_URLS = get_env("RTSP_URLS")
 
+# ── RTMP / MediaMTX ──────────────────────────────────────────────────
+RTMP_BASE_URL = get_env("RTMP_BASE_URL", "rtmp://localhost:1935/live")
+
 # ── PostgreSQL ───────────────────────────────────────────────────────
 DATABASE_URL = get_env(
     "DATABASE_URL",
