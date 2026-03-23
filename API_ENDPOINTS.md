@@ -32,7 +32,7 @@
 | GET    | `/api/v1/connect/health`                  | Connect service health       |
 | GET    | `/api/v1/stream/health`                   | Stream service health        |
 | POST   | `/api/v1/llm/chat`                        | Send chat messages to LLM    |
-| POST   | `/api/v1/vision/detect-youtube`           | Start YOLOv11 detection job  |
+| POST   | `/api/v1/vision/detect-youtube`           | Start YOLO26 detection job   |
 | GET    | `/api/v1/vision/jobs/{job_id}`            | Poll job status              |
 | GET    | `/api/v1/vision/jobs/{job_id}/stream`     | Stream job status via SSE    |
 | POST   | `/api/v1/vision/jobs/{job_id}/stop`       | Stop a running job           |
@@ -124,7 +124,7 @@ Send a conversation to the Scaleway-hosted LLM and receive an AI response. Optio
 
 ## Vision — Object Detection
 
-The Vision module runs YOLOv11 object detection on YouTube video streams as background jobs. Each job gets a unique `job_id` that you use to poll status, stream events, or stop the job.
+The Vision module runs YOLO26 object detection on YouTube video streams as background jobs. Each job gets a unique `job_id` that you use to poll status, stream events, or stop the job.
 
 ### Typical Frontend Flow
 
@@ -139,7 +139,7 @@ The Vision module runs YOLOv11 object detection on YouTube video streams as back
 
 ### `POST /api/v1/vision/detect-youtube`
 
-Start a new YOLOv11 detection job on a YouTube video. The job runs in the background; use the returned `job_id` to track progress.
+Start a new YOLO26 detection job on a YouTube video. The job runs in the background; use the returned `job_id` to track progress.
 
 **Request Body** — `application/json`
 
@@ -164,7 +164,7 @@ Start a new YOLOv11 detection job on a YouTube video. The job runs in the backgr
 {
   "job_id": "a3f1b2c4-5678-9abc-def0-1234567890ab",
   "status": "queued",
-  "detail": "YOLOv11 job queued.",
+  "detail": "YOLO26 job queued.",
   "result": null,
   "error": null
 }

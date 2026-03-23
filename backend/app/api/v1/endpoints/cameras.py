@@ -1,3 +1,8 @@
+import asyncio
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import cv2
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -10,7 +15,14 @@ from app.core.deps import get_current_user, get_current_user_from_query_token
 from app.models.user import User
 from app.models.camera import Camera
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/cameras")
+
+_LIVE_FPS = 15
+_MAX_CONSECUTIVE_DROPS = 30
+_CONNECT_TIMEOUT_S = 10
+_STREAM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mjpeg")
 
 
 class CameraCreateRequest(BaseModel):
@@ -135,13 +147,34 @@ async def delete_camera(
     return {"status": "deleted", "camera_id": camera_id}
 
 
+def _open_capture(rtsp_url: str) -> cv2.VideoCapture | None:
+    """Try to open an RTSP stream.
+
+    Runs in _STREAM_POOL so it never touches the async event loop.
+    Timeout is handled by FFmpeg's stimeout option (set globally via
+    OPENCV_FFMPEG_CAPTURE_OPTIONS) plus the asyncio.wait_for in the caller.
+    """
+    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        cap.release()
+        logger.warning("camera_open_failed url=%s", rtsp_url)
+        return None
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    logger.info("camera_connected url=%s", rtsp_url)
+    return cap
+
+
 @router.get("/{camera_id}/live")
 async def camera_live(
     camera_id: str,
     current_user: User = Depends(get_current_user_from_query_token),
     db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
-    """Stream live MJPEG from the camera's RTSP URL. Auth via ?token=JWT."""
+    """Stream live MJPEG from the camera's RTSP URL. Auth via ?token=JWT.
+
+    Connection is opened in a dedicated threadpool with a hard timeout,
+    so an unreachable camera returns 503 instead of freezing the server.
+    """
     result = await db.execute(
         select(Camera).where(
             Camera.id == camera_id,
@@ -155,8 +188,20 @@ async def camera_live(
             detail="Camera not found.",
         )
 
-    cap = cv2.VideoCapture(cam.rtsp_url)
-    if not cap.isOpened():
+    loop = asyncio.get_event_loop()
+    try:
+        cap = await asyncio.wait_for(
+            loop.run_in_executor(_STREAM_POOL, _open_capture, cam.rtsp_url),
+            timeout=_CONNECT_TIMEOUT_S + 2,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("camera_timeout id=%s url=%s", camera_id, cam.rtsp_url)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Camera connection timed out.",
+        )
+
+    if cap is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Unable to connect to camera stream.",
@@ -169,12 +214,19 @@ async def camera_live(
 
 
 def _mjpeg_generator(cap: cv2.VideoCapture):
-    """Yield MJPEG frames from an open VideoCapture."""
+    """Yield MJPEG frames from an already-connected capture."""
+    interval = 1.0 / _LIVE_FPS
+    consecutive_drops = 0
+
     try:
-        while True:
+        while consecutive_drops < _MAX_CONSECUTIVE_DROPS:
             ret, frame = cap.read()
             if not ret:
-                break
+                consecutive_drops += 1
+                time.sleep(0.05)
+                continue
+            consecutive_drops = 0
+
             _, jpeg = cv2.imencode(".jpg", frame)
             if jpeg is None:
                 continue
@@ -186,5 +238,6 @@ def _mjpeg_generator(cap: cv2.VideoCapture):
                 + data
                 + b"\r\n"
             )
+            time.sleep(interval)
     finally:
         cap.release()

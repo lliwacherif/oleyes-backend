@@ -27,7 +27,7 @@ This guide documents the backend API and configuration so a React client can int
       security.py
     /services
       /vision_engine
-        yolo11_service.py
+        yolo26_service.py
       /llm_engine
         scaleway_client.py
       /camera_manager
@@ -46,7 +46,7 @@ SCALWAY_API_KEY=YOUR_KEY_HERE
 SCALWAY_BASE_URL=https://api.scaleway.ai/d067acb3-2897-4c85-a126-957eb6768d0b/v1
 SCALWAY_MODEL=gpt-oss-120b
 SCALWAY_TIMEOUT=30
-YOLO_MODEL=yolo11n.pt
+YOLO_MODEL=yolo26n.pt
 YOLO_DEVICE=cpu
 YOLO_CONF=0.25
 RTSP_URLS=
@@ -109,7 +109,7 @@ Notes:
 - This uses Scaleway’s OpenAI-compatible API.
 - Streaming can be added later if needed.
 
-### YOLOv11 — YouTube Detection
+### YOLO26 — YouTube Detection
 
 ```
 POST /api/v1/vision/detect-youtube
@@ -128,13 +128,13 @@ Response body:
 {
   "job_id": "uuid",
   "status": "queued",
-  "detail": "YOLOv11 job queued.",
+  "detail": "YOLO26 job queued.",
   "result": null,
   "error": null
 }
 ```
 
-### YOLOv11 — Job Status
+### YOLO26 — Job Status
 
 ```
 GET /api/v1/vision/jobs/{job_id}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections import deque
 from threading import Lock
 from threading import Event
@@ -16,7 +17,18 @@ from app.services.vision_engine.logic_engine import AdvancedLogicEngine
 
 logger = logging.getLogger(__name__)
 
-class Yolo11Service:
+# FFmpeg capture options (global, applied to all cv2.VideoCapture calls):
+#   HTTP  — timeout 120s, auto-reconnect (for YouTube streams)
+#   RTSP  — stimeout 10s socket timeout (for cameras)
+# NOTE: rtsp_transport is NOT forced here so cameras auto-negotiate UDP/TCP.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "timeout;120000000|reconnect;1|reconnect_streamed;1|reconnect_delay_max;30"
+    "|stimeout;10000000",
+)
+
+
+class Yolo26Service:
     def __init__(self) -> None:
         self._jobs: dict[str, dict[str, object]] = {}
         self._model: YOLO | None = None
@@ -36,9 +48,40 @@ class Yolo11Service:
                 self._model = YOLO(config.YOLO_MODEL)
         return self._model
 
+    def stop_all_running(self) -> int:
+        """Signal every running/queued job to stop. Returns how many were stopped."""
+        count = 0
+        for jid, job in list(self._jobs.items()):
+            if job.get("status") in ("running", "queued"):
+                stop_event = job.get("stop_event")
+                if isinstance(stop_event, Event):
+                    stop_event.set()
+                job["status"] = "stopped"
+                job["finished_at"] = time()
+                count += 1
+                logger.info("auto_stopped job=%s (new job incoming)", jid)
+        return count
+
+    def _reset_tracker(self) -> None:
+        """Clear the model's internal tracker state so new jobs start fresh."""
+        model = self._model
+        if model is None:
+            return
+        predictor = getattr(model, "predictor", None)
+        if predictor is None:
+            return
+        trackers = getattr(predictor, "trackers", None)
+        if trackers:
+            for t in trackers:
+                if hasattr(t, "reset"):
+                    t.reset()
+            logger.info("tracker_state_reset")
+
     def register_job(
         self, *, job_id: str, source_url: str, scene_context: str | None = None
     ) -> None:
+        self.stop_all_running()
+        self._reset_tracker()
         self._jobs[job_id] = {
             "status": "queued",
             "source_url": source_url,
@@ -93,6 +136,7 @@ class Yolo11Service:
                 return
             resolved_source = self._resolve_source(source_url)
             logger.info("yolo_source_resolved id=%s", job_id)
+            self._reset_tracker()
             model = self._get_model()
             results = model.track(
                 source=resolved_source,
@@ -241,6 +285,47 @@ class Yolo11Service:
         stop_event = job.get("stop_event")
         return bool(isinstance(stop_event, Event) and stop_event.is_set())
 
+    _CALM_SPEED = 10.0  # px/s
+
+    @staticmethod
+    def _extract_json(text: str) -> dict | None:
+        """Pull a JSON object out of LLM output that may be wrapped in
+        markdown, thinking tags, or surrounding prose."""
+        import re
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                return obj
+        except (json.JSONDecodeError, TypeError):
+            pass
+        for m in reversed(list(re.finditer(r'\{[^{}]*\}', text))):
+            try:
+                obj = json.loads(m.group())
+                if isinstance(obj, dict) and ("risk" in str(obj) or obj.get("label")):
+                    return obj
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return None
+
+    def _scene_is_calm(self, job: dict[str, object]) -> bool:
+        logic = job.get("logic")
+        if not isinstance(logic, dict):
+            return True
+        scene_text = logic.get("scene_text", "")
+        if "ALERT" in scene_text or "DISAPPEARED" in scene_text:
+            return False
+        objects = logic.get("objects", [])
+        if not objects:
+            return True
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("speed", 0) >= self._CALM_SPEED:
+                return False
+            if obj.get("erratic", False):
+                return False
+        return True
+
     def _maybe_analyze(self, job: dict[str, object]) -> None:
         batch = job.get("last_event", {})
         if not isinstance(batch, dict):
@@ -261,6 +346,17 @@ class Yolo11Service:
         if texts:
             buffer.append("\n".join(texts))
 
+        calm = self._scene_is_calm(job)
+
+        if calm:
+            job["analysis"] = {
+                "risk_score": 0, "risk_score_raw": 0,
+                "risk_level": "LOW", "label": "Normal activity",
+                "explanation": "Scene is calm, no significant movement detected.",
+                "text": "",
+            }
+            return
+
         if len(buffer) < 2:
             return
 
@@ -268,9 +364,9 @@ class Yolo11Service:
         system_prompt = config.SCALWAY_SYSTEM_PROMPT or ""
         scene_context = job.get("scene_context")
         if scene_context:
-            system_prompt = system_prompt.replace(
-                "monitoring a CCTV feed",
-                f"monitoring a CCTV feed in: {scene_context}",
+            system_prompt += (
+                f"\n\nSCENE CONTEXT (use this to judge what is normal vs suspicious):\n"
+                f"{scene_context}"
             )
         payload = {
             "model": config.SCALWAY_ANALYSIS_MODEL,
@@ -283,8 +379,15 @@ class Yolo11Service:
             "top_p": config.SCALWAY_ANALYSIS_TOP_P,
             "presence_penalty": config.SCALWAY_ANALYSIS_PRESENCE_PENALTY,
             "stream": False,
-            "response_format": {"type": "json_object"},
         }
+
+        fallback = {
+            "risk_score": 30, "risk_score_raw": 30,
+            "risk_level": "MEDIUM", "label": "Activity detected",
+            "explanation": "Movement or event detected, AI assessment pending.",
+            "text": "",
+        }
+
         try:
             response = self._analysis_client.post("/chat/completions", json=payload)
             response.raise_for_status()
@@ -292,20 +395,21 @@ class Yolo11Service:
             raw_content = (
                 data.get("choices", [{}])[0]
                 .get("message", {})
-                .get("content", "")
-            )
+                .get("content")
+            ) or ""
 
-            # Parse JSON response from LLM
-            try:
-                analysis = json.loads(raw_content)
-            except json.JSONDecodeError:
-                # Fallback: treat as plain text if LLM didn't return JSON
-                analysis = {
-                    "risk_score": 0,
-                    "risk_level": "LOW",
-                    "label": "Parse Error",
-                    "explanation": raw_content[:80],
-                }
+            if not raw_content:
+                logger.warning("LLM empty content — using fallback")
+                job["analysis"] = fallback
+                buffer.clear()
+                return
+
+            analysis = self._extract_json(raw_content)
+            if not analysis or not analysis.get("label"):
+                logger.warning("LLM no JSON found — raw: %s", raw_content[:200])
+                job["analysis"] = fallback
+                buffer.clear()
+                return
 
             # --- Risk score smoothing ---
             raw_score = int(analysis.get("risk_score", 0))
@@ -317,7 +421,6 @@ class Yolo11Service:
 
             smoothed_score = int(sum(risk_scores) / len(risk_scores))
 
-            # Only escalate to HIGH if score stays >= 70 for 3+ consecutive updates
             consecutive_high = sum(1 for s in risk_scores if s >= 70)
             if consecutive_high >= 3:
                 smoothed_level = "HIGH"
@@ -332,6 +435,7 @@ class Yolo11Service:
             analysis["text"] = raw_content
 
             job["analysis"] = analysis
+            buffer.clear()
 
             logger.info(
                 "🤖 Analysis: %s | risk=%d (raw=%d) %s",
@@ -340,7 +444,7 @@ class Yolo11Service:
                 raw_score,
                 smoothed_level,
             )
-            buffer.clear()
         except Exception as exc:  # pragma: no cover
             logger.warning("❌ Analysis failed: %s", exc)
-            job["analysis"] = {"text": "", "error": str(exc)}
+            job["analysis"] = fallback
+            buffer.clear()

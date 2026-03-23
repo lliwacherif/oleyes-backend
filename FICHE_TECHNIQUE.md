@@ -1,7 +1,7 @@
 # Smart AI CCTV Orchestrator — Fiche Technique
 
 ## Présentation Produit
-Smart AI CCTV Orchestrator est une plateforme de vidéosurveillance intelligente, conçue pour analyser en temps réel des flux vidéo (YouTube, RTSP, CCTV) et fournir des descriptions d’activité claires et exploitables. Le système combine vision par ordinateur (YOLOv11) et raisonnement LLM pour transformer des détections brutes en informations opérationnelles.
+Smart AI CCTV Orchestrator est une plateforme de vidéosurveillance intelligente, conçue pour analyser en temps réel des flux vidéo (YouTube, RTSP, CCTV) et fournir des descriptions d’activité claires et exploitables. Le système combine vision par ordinateur (YOLO26) et raisonnement LLM pour transformer des détections brutes en informations opérationnelles.
 
 ## Objectif
 Offrir une solution de surveillance proactive, performante et extensible, capable de:
@@ -19,7 +19,7 @@ Offrir une solution de surveillance proactive, performante et extensible, capabl
 
 ## Fonctionnalités Principales
 - Ingestion vidéo (YouTube / RTSP)
-- Détection d’objets avec YOLOv11 + tracking
+- Détection d’objets avec YOLO26 + tracking
 - Extraction de vecteurs par frame (class_id, conf, bbox, track_id)
 - Génération de descriptions de scène en texte
 - Analyse LLM périodique (toutes les 8 frames)
@@ -27,7 +27,7 @@ Offrir une solution de surveillance proactive, performante et extensible, capabl
 - Arrêt manuel des jobs en cours
 
 ## Flux de Données
-1. **Flux vidéo** → YOLOv11
+1. **Flux vidéo** → YOLO26
 2. **Vecteurs de détection** → Logic Engine
 3. **Texte de scène** → LLM (Scaleway Qwen)
 4. **Résultats** → UI (SSE streaming)

@@ -12,11 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.user import User
-from app.models.user_context import UserContext
-from app.services.vision_engine.yolo11_service import Yolo11Service
+from app.models.scene_context import SceneContext
+from app.services.vision_engine.yolo26_service import Yolo26Service
 
 router = APIRouter(prefix="/vision")
-_service = Yolo11Service()
+_service = Yolo26Service()
 
 
 class VisionJobResponse(BaseModel):
@@ -56,11 +56,11 @@ async def start_youtube_detection(
     scene_context = request.scene_context
     if not scene_context:
         result = await db.execute(
-            select(UserContext).where(UserContext.user_id == current_user.id)
+            select(SceneContext).where(SceneContext.user_id == current_user.id)
         )
-        ctx = result.scalar_one_or_none()
-        if ctx:
-            scene_context = ctx.context_text
+        sc = result.scalar_one_or_none()
+        if sc and sc.refined_text:
+            scene_context = sc.refined_text
 
     job_id = str(uuid4())
     _service.register_job(
@@ -74,7 +74,7 @@ async def start_youtube_detection(
     return VisionJobResponse(
         job_id=job_id,
         status="queued",
-        detail="YOLOv11 job queued.",
+        detail="YOLO26 job queued.",
     )
 
 
@@ -88,11 +88,11 @@ async def start_rtsp_detection(
     scene_context = request.scene_context
     if not scene_context:
         result = await db.execute(
-            select(UserContext).where(UserContext.user_id == current_user.id)
+            select(SceneContext).where(SceneContext.user_id == current_user.id)
         )
-        ctx = result.scalar_one_or_none()
-        if ctx:
-            scene_context = ctx.context_text
+        sc = result.scalar_one_or_none()
+        if sc and sc.refined_text:
+            scene_context = sc.refined_text
 
     job_id = str(uuid4())
     _service.register_job(
@@ -160,3 +160,9 @@ async def stop_job(job_id: str) -> dict:
     if not stopped:
         return {"status": "not_found", "job_id": job_id}
     return {"status": "stopped", "job_id": job_id}
+
+
+@router.post("/stop-all")
+async def stop_all_jobs() -> dict:
+    count = _service.stop_all_running()
+    return {"status": "ok", "stopped": count}

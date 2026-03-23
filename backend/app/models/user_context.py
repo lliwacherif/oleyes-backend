@@ -33,9 +33,9 @@ class UserContext(Base):
     business_size: Mapped[str | None] = mapped_column(String(50), nullable=True)
     camera_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
     theft_detection: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    suspicious_behavior_detection: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    loitering_detection: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    employee_monitoring: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    fire_detection: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    person_fall_detection: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    violence_detection: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     customer_behavior_analytics: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     context_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -63,9 +63,9 @@ class UserContext(Base):
             "business_size": self.business_size,
             "camera_type": self.camera_type,
             "theft_detection": self.theft_detection,
-            "suspicious_behavior_detection": self.suspicious_behavior_detection,
-            "loitering_detection": self.loitering_detection,
-            "employee_monitoring": self.employee_monitoring,
+            "fire_detection": self.fire_detection,
+            "person_fall_detection": self.person_fall_detection,
+            "violence_detection": self.violence_detection,
             "customer_behavior_analytics": self.customer_behavior_analytics,
         }
         self.context_text = json.dumps(data)

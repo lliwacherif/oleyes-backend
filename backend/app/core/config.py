@@ -12,13 +12,13 @@ def get_env(name: str, default: str | None = None) -> str | None:
 SCALWAY_API_KEY = get_env("SCALWAY_API_KEY")
 SCALWAY_BASE_URL = get_env(
     "SCALWAY_BASE_URL",
-    "https://api.scaleway.ai/d067acb3-2897-4c85-a126-957eb6768d0b/v1",
+    "https://api.scaleway.ai/1b0ca8d6-b434-4200-9818-4f56c17232ff/v1",
 )
 SCALWAY_MODEL = get_env("SCALWAY_MODEL", "gpt-oss-120b")
 SCALWAY_TIMEOUT = float(get_env("SCALWAY_TIMEOUT", "30"))
 SCALWAY_ANALYSIS_MODEL = get_env(
     "SCALWAY_ANALYSIS_MODEL",
-    "qwen3-235b-a22b-instruct-2507",
+    "gpt-oss-120b",
 )
 SCALWAY_SYSTEM_PROMPT = get_env(
     "SCALWAY_SYSTEM_PROMPT",
@@ -32,14 +32,14 @@ SCALWAY_SYSTEM_PROMPT = get_env(
     '{"risk_score": 0-100, "risk_level": "LOW"|"MEDIUM"|"HIGH", '
     '"label": "2-5 word title", "explanation": "1 sentence max 20 words"}',
 )
-SCALWAY_ANALYSIS_MAX_TOKENS = int(get_env("SCALWAY_ANALYSIS_MAX_TOKENS", "120"))
+SCALWAY_ANALYSIS_MAX_TOKENS = int(get_env("SCALWAY_ANALYSIS_MAX_TOKENS", "300"))
 SCALWAY_ANALYSIS_TEMPERATURE = float(get_env("SCALWAY_ANALYSIS_TEMPERATURE", "0.2"))
 SCALWAY_ANALYSIS_TOP_P = float(get_env("SCALWAY_ANALYSIS_TOP_P", "0.8"))
 SCALWAY_ANALYSIS_PRESENCE_PENALTY = float(
     get_env("SCALWAY_ANALYSIS_PRESENCE_PENALTY", "0.0")
 )
 
-YOLO_MODEL = get_env("YOLO_MODEL", "yolo11n.pt")
+YOLO_MODEL = get_env("YOLO_MODEL", "yolo26n.pt")
 YOLO_DEVICE = get_env("YOLO_DEVICE", "cpu")
 YOLO_CONF = float(get_env("YOLO_CONF", "0.25"))
 YOLO_MAX_DETECTIONS = int(get_env("YOLO_MAX_DETECTIONS", "100"))
