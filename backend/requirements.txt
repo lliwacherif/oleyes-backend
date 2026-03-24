@@ -13,3 +13,4 @@ asyncpg
 psycopg[binary]
 bcrypt
 python-jose[cryptography]
+pypdf

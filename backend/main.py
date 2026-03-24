@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1.endpoints import auth, cameras, connect, context, llm, stream, vision
+from app.api.v1.endpoints import auth, cameras, chatbot_mads, connect, context, llm, stream, vision
 from app.core.database import init_db, close_db
 import app.models  # noqa: F401 — register ORM models with Base.metadata
 
@@ -53,6 +53,7 @@ async def health_check() -> dict:
 
 app.include_router(auth.router, prefix="/api/v1", tags=["auth"])
 app.include_router(cameras.router, prefix="/api/v1", tags=["cameras"])
+app.include_router(chatbot_mads.router, prefix="/api/v1", tags=["chatbot-mads"])
 app.include_router(connect.router, prefix="/api/v1", tags=["connect"])
 app.include_router(context.router, prefix="/api/v1", tags=["context"])
 app.include_router(llm.router, prefix="/api/v1", tags=["llm"])
