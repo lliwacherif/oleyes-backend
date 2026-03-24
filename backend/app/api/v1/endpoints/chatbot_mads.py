@@ -1,4 +1,5 @@
 import logging
+import re
 from pathlib import Path
 
 import httpx
@@ -10,6 +11,8 @@ from app.core import config
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chatbot-mads")
+
+_MAX_DOC_CHARS = 45_000
 
 _SYSTEM_PROMPT = (
     "**Role:** You are the MADS CRM In-App Support Assistant. "
@@ -31,8 +34,6 @@ _SYSTEM_PROMPT = (
 )
 
 _PDF_PATH = Path(__file__).resolve().parents[3] / "chatbot_files" / "MADS.pdf"
-
-_DOC_CONTEXT: str = ""
 
 
 def _load_pdf_text() -> str:
@@ -56,7 +57,7 @@ def _load_pdf_text() -> str:
         logger.info("mads_pdf_loaded pages=%d chars=%d", len(reader.pages), len(text))
         return text
     except ImportError:
-        logger.warning("PyPDF2 not installed, reading raw text fallback")
+        logger.warning("PyPDF2 not installed either")
 
     if _PDF_PATH.exists():
         raw = _PDF_PATH.read_bytes()
@@ -67,7 +68,20 @@ def _load_pdf_text() -> str:
     return ""
 
 
-_DOC_CONTEXT = _load_pdf_text()
+def _compress_doc(text: str) -> str:
+    """Reduce whitespace and page markers to save tokens."""
+    text = re.sub(r"-- \d+ of \d+ --", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = text.strip()
+    if len(text) > _MAX_DOC_CHARS:
+        text = text[:_MAX_DOC_CHARS] + "\n\n[Document truncated]"
+        logger.warning("mads_doc_truncated to %d chars", _MAX_DOC_CHARS)
+    return text
+
+
+_DOC_CONTEXT = _compress_doc(_load_pdf_text())
+logger.info("mads_doc_final_size chars=%d", len(_DOC_CONTEXT))
 
 
 def _build_system_message() -> str:
@@ -109,7 +123,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
         async with httpx.AsyncClient(
             base_url=config.SCALWAY_BASE_URL,
             headers={"Authorization": f"Bearer {config.SCALWAY_API_KEY}"},
-            timeout=60.0,
+            timeout=90.0,
         ) as client:
             resp = await client.post("/chat/completions", json=payload)
             resp.raise_for_status()
@@ -133,19 +147,27 @@ async def chat(request: ChatRequest) -> ChatResponse:
         return ChatResponse(reply=content.strip())
 
     except httpx.HTTPStatusError as exc:
-        logger.error("mads_chat_error status=%s body=%s", exc.response.status_code, exc.response.text[:200])
+        body = exc.response.text[:300]
+        logger.error("mads_chat_error status=%s body=%s", exc.response.status_code, body)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"LLM API error: {exc.response.status_code}",
+            detail=f"LLM API error {exc.response.status_code}: {body}",
         )
     except httpx.TimeoutException:
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail="LLM request timed out.",
         )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("mads_chat_unexpected error=%s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unexpected error: {str(exc)[:200]}",
+        )
 
 
 def _strip_thinking(text: str) -> str:
     """Remove <think>...</think> blocks that some models emit despite instructions."""
-    import re
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
