@@ -33,7 +33,7 @@ _SYSTEM_PROMPT = (
     "5. **Always respond in the same language the user writes in.**"
 )
 
-_PDF_PATH = Path(__file__).resolve().parents[3] / "chatbot_files" / "MADS.pdf"
+_PDF_PATH = Path(__file__).resolve().parents[4] / "chatbot_files" / "MADS.pdf"
 
 
 def _load_pdf_text() -> str:
