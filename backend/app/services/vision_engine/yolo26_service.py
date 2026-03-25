@@ -88,14 +88,23 @@ class Yolo26Service:
         source_url: str,
         scene_context: str | None = None,
         stream_protocol: str = "RTSP",
+        zones: dict[str, list[list[float]]] | None = None,
     ) -> None:
         self.stop_all_running()
         self._reset_tracker()
+
+        if zones:
+            self._logic.set_zones(zones)
+            logger.info("roi_zones_loaded count=%d names=%s", len(zones), list(zones.keys()))
+        else:
+            self._logic.set_zones({})
+
         self._jobs[job_id] = {
             "status": "queued",
             "source_url": source_url,
             "scene_context": scene_context,
             "stream_protocol": stream_protocol,
+            "zones": zones or {},
             "result": None,
             "error": None,
             "frames": 0,
@@ -108,6 +117,7 @@ class Yolo26Service:
             "batch": [],
             "analysis_buffer": [],
             "analysis": None,
+            "zone_alerts": [],
             "risk_scores": deque(maxlen=5),
             "stop_event": Event(),
         }
@@ -286,6 +296,22 @@ class Yolo26Service:
         job["logic"] = logic_summary
         event["scene_text"] = logic_summary.get("scene_text", "")
 
+        scene_text = logic_summary.get("scene_text", "")
+        if "ZONE_INTRUSION" in scene_text:
+            alerts = job.get("zone_alerts")
+            if isinstance(alerts, list):
+                for line in scene_text.split("\n"):
+                    if "ZONE_INTRUSION" in line:
+                        alert = {
+                            "type": "ZONE_INTRUSION",
+                            "message": line.strip().lstrip("- "),
+                            "frame": frame_index,
+                            "timestamp": time(),
+                        }
+                        alerts.append(alert)
+                        if len(alerts) > 50:
+                            alerts.pop(0)
+
         batch = job.get("batch")
         if isinstance(batch, list):
             batch.append(event)
@@ -376,6 +402,7 @@ class Yolo26Service:
             "detail": detail,
             "logic": job.get("logic"),
             "analysis": job.get("analysis"),
+            "zone_alerts": job.get("zone_alerts", []),
         }
 
     def _is_stopped(self, job: dict[str, object]) -> bool:

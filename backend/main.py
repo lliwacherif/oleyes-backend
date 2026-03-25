@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1.endpoints import auth, cameras, chatbot_mads, connect, context, llm, stream, vision
+from app.api.v1.endpoints import auth, cameras, chatbot_mads, connect, context, llm, stream, vision, zones
 from app.core.database import init_db, close_db
 import app.models  # noqa: F401 — register ORM models with Base.metadata
 
@@ -59,3 +59,4 @@ app.include_router(context.router, prefix="/api/v1", tags=["context"])
 app.include_router(llm.router, prefix="/api/v1", tags=["llm"])
 app.include_router(stream.router, prefix="/api/v1", tags=["stream"])
 app.include_router(vision.router, prefix="/api/v1", tags=["vision"])
+app.include_router(zones.router, prefix="/api/v1", tags=["zones"])

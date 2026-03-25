@@ -14,10 +14,28 @@ from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.user import User
 from app.models.scene_context import SceneContext
+from app.models.zone import Zone
 from app.services.vision_engine.yolo26_service import Yolo26Service
 
 router = APIRouter(prefix="/vision")
 _service = Yolo26Service()
+
+
+async def _load_zones(camera_id: str | None, db: AsyncSession) -> dict[str, list[list[float]]]:
+    """Load ROI zones for a camera from DB. Returns {name: [[x,y], ...]}."""
+    if not camera_id:
+        return {}
+    import json as _json
+    result = await db.execute(select(Zone).where(Zone.camera_id == camera_id))
+    zones_dict: dict[str, list[list[float]]] = {}
+    for z in result.scalars().all():
+        try:
+            pts = _json.loads(z.points)
+            if isinstance(pts, list) and len(pts) >= 3:
+                zones_dict[z.name] = pts
+        except Exception:
+            continue
+    return zones_dict
 
 
 class VisionJobResponse(BaseModel):
@@ -41,6 +59,7 @@ class VisionYoutubeRequest(BaseModel):
 
 class VisionRtspRequest(BaseModel):
     rtsp_url: str = Field(..., min_length=1, description="RTSP stream URL")
+    camera_id: str | None = Field(default=None, description="Camera ID to load ROI zones from")
     scene_context: str | None = Field(
         default=None,
         description="Optional scene description to ground the AI analysis",
@@ -52,6 +71,7 @@ class VisionRtmpRequest(BaseModel):
         ..., min_length=1,
         description="MediaMTX stream key (e.g. 'cam1')",
     )
+    camera_id: str | None = Field(default=None, description="Camera ID to load ROI zones from")
     scene_context: str | None = Field(
         default=None,
         description="Optional scene description to ground the AI analysis",
@@ -106,11 +126,13 @@ async def start_rtsp_detection(
         if sc and sc.refined_text:
             scene_context = sc.refined_text
 
+    zones = await _load_zones(request.camera_id, db)
     job_id = str(uuid4())
     _service.register_job(
         job_id=job_id,
         source_url=request.rtsp_url,
         scene_context=scene_context,
+        zones=zones or None,
     )
     background_tasks.add_task(
         _service.start_job, job_id=job_id, source_url=request.rtsp_url
@@ -118,7 +140,7 @@ async def start_rtsp_detection(
     return VisionJobResponse(
         job_id=job_id,
         status="queued",
-        detail="RTSP detection job queued.",
+        detail=f"RTSP detection job queued ({len(zones)} ROI zones).",
     )
 
 
@@ -138,6 +160,7 @@ async def start_rtmp_detection(
         if sc and sc.refined_text:
             scene_context = sc.refined_text
 
+    zones = await _load_zones(request.camera_id, db)
     base = config.RTMP_BASE_URL.rstrip("/")
     rtmp_url = f"{base}/{request.stream_key}"
     job_id = str(uuid4())
@@ -146,6 +169,7 @@ async def start_rtmp_detection(
         source_url=rtmp_url,
         scene_context=scene_context,
         stream_protocol="RTMP",
+        zones=zones or None,
     )
     background_tasks.add_task(
         _service.start_job, job_id=job_id, source_url=rtmp_url
@@ -153,7 +177,7 @@ async def start_rtmp_detection(
     return VisionJobResponse(
         job_id=job_id,
         status="queued",
-        detail=f"RTMP detection job queued (stream_key={request.stream_key}).",
+        detail=f"RTMP detection job queued ({len(zones)} ROI zones).",
     )
 
 

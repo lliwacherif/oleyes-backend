@@ -100,6 +100,10 @@ class AdvancedLogicEngine:
             "timestamp": 0.0,
         }
 
+    def set_zones(self, zones: dict[str, Iterable[Iterable[float]]]) -> None:
+        """Replace active zones at runtime (e.g. when a new job starts)."""
+        self._zones = {name: Polygon(points) for name, points in zones.items()}
+
     def update(self, yolo_results: dict[str, Any] | list[Any]) -> None:
         detections = self._normalize_detections(yolo_results)
         if not detections:
@@ -197,8 +201,14 @@ class AdvancedLogicEngine:
             seen_ids.add(track_id)
 
             zone = self._find_zone(center)
+            prev_zone = hist.get("current_zone")
+            hist["current_zone"] = zone
             if zone:
                 hist["zone_durations"][zone] += dt
+                if zone != prev_zone:
+                    self._event_log.append(
+                        f"ZONE_INTRUSION: {class_name}#{track_id} entered zone '{zone}'."
+                    )
 
             speed_hist = np.array(hist["speed_hist"], dtype=float)
             erratic = bool(speed_hist.size >= 3 and speed_hist.std() > self._erratic_std)
