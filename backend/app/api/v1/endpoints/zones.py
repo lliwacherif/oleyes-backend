@@ -30,12 +30,14 @@ class ZoneCreateRequest(BaseModel):
         description="Polygon vertices (minimum 3 points)",
     )
     color: str = Field("#FF0000", max_length=20)
+    instruction: str = Field("", max_length=500, description="Alert rule, e.g. 'Alert if any person enters this area'")
 
 
 class ZoneUpdateRequest(BaseModel):
     name: str | None = Field(None, max_length=100)
     points: list[ZonePoint] | None = Field(None, min_length=3)
     color: str | None = Field(None, max_length=20)
+    instruction: str | None = Field(None, max_length=500)
 
 
 class ZoneResponse(BaseModel):
@@ -44,6 +46,7 @@ class ZoneResponse(BaseModel):
     name: str
     points: list[ZonePoint]
     color: str
+    instruction: str
     created_at: str
     updated_at: str
 
@@ -56,6 +59,7 @@ def _to_response(z: Zone) -> ZoneResponse:
         name=z.name,
         points=[ZonePoint(x=p[0], y=p[1]) for p in pts],
         color=z.color,
+        instruction=z.instruction or "",
         created_at=z.created_at.isoformat(),
         updated_at=z.updated_at.isoformat(),
     )
@@ -99,6 +103,7 @@ async def create_zone(
         name=request.name,
         points=pts_json,
         color=request.color,
+        instruction=request.instruction,
     )
     db.add(zone)
     await db.flush()
@@ -124,6 +129,8 @@ async def update_zone(
         zone.points = json.dumps([[p.x, p.y] for p in request.points])
     if request.color is not None:
         zone.color = request.color
+    if request.instruction is not None:
+        zone.instruction = request.instruction
 
     await db.flush()
     return _to_response(zone)

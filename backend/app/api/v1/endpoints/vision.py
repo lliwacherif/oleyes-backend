@@ -21,21 +21,32 @@ router = APIRouter(prefix="/vision")
 _service = Yolo26Service()
 
 
-async def _load_zones(camera_id: str | None, db: AsyncSession) -> dict[str, list[list[float]]]:
-    """Load ROI zones for a camera from DB. Returns {name: [[x,y], ...]}."""
+async def _load_zones(camera_id: str | None, db: AsyncSession) -> tuple[
+    dict[str, list[list[float]]],
+    dict[str, str],
+]:
+    """Load ROI zones + instructions for a camera from DB.
+
+    Returns (zones_dict, instructions_dict):
+      zones_dict:        {name: [[x,y], ...]}
+      instructions_dict: {name: "user instruction text"}
+    """
     if not camera_id:
-        return {}
+        return {}, {}
     import json as _json
     result = await db.execute(select(Zone).where(Zone.camera_id == camera_id))
     zones_dict: dict[str, list[list[float]]] = {}
+    instructions_dict: dict[str, str] = {}
     for z in result.scalars().all():
         try:
             pts = _json.loads(z.points)
             if isinstance(pts, list) and len(pts) >= 3:
                 zones_dict[z.name] = pts
+                if z.instruction and z.instruction.strip():
+                    instructions_dict[z.name] = z.instruction.strip()
         except Exception:
             continue
-    return zones_dict
+    return zones_dict, instructions_dict
 
 
 class VisionJobResponse(BaseModel):
@@ -126,13 +137,14 @@ async def start_rtsp_detection(
         if sc and sc.refined_text:
             scene_context = sc.refined_text
 
-    zones = await _load_zones(request.camera_id, db)
+    zones, zone_instructions = await _load_zones(request.camera_id, db)
     job_id = str(uuid4())
     _service.register_job(
         job_id=job_id,
         source_url=request.rtsp_url,
         scene_context=scene_context,
         zones=zones or None,
+        zone_instructions=zone_instructions or None,
     )
     background_tasks.add_task(
         _service.start_job, job_id=job_id, source_url=request.rtsp_url
@@ -160,7 +172,7 @@ async def start_rtmp_detection(
         if sc and sc.refined_text:
             scene_context = sc.refined_text
 
-    zones = await _load_zones(request.camera_id, db)
+    zones, zone_instructions = await _load_zones(request.camera_id, db)
     base = config.RTMP_BASE_URL.rstrip("/")
     rtmp_url = f"{base}/{request.stream_key}"
     job_id = str(uuid4())
@@ -170,6 +182,7 @@ async def start_rtmp_detection(
         scene_context=scene_context,
         stream_protocol="RTMP",
         zones=zones or None,
+        zone_instructions=zone_instructions or None,
     )
     background_tasks.add_task(
         _service.start_job, job_id=job_id, source_url=rtmp_url

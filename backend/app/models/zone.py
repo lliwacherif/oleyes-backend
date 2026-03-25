@@ -36,6 +36,12 @@ class Zone(Base):
         default="#FF0000",
         server_default="#FF0000",
     )
+    instruction: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        default="",
+        server_default="",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

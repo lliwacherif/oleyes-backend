@@ -175,6 +175,11 @@ class AdvancedLogicEngine:
             conf = float(det.get("confidence", 0.0))
             bbox = np.array(det.get("bbox", det.get("xyxy", [0, 0, 0, 0])), dtype=float)
             center = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2])
+            zone_point = (
+                np.array([(bbox[0] + bbox[2]) / 2, bbox[3]])
+                if class_id in self._person_class_ids
+                else center
+            )
 
             if track_id not in self._history:
                 self._history[track_id] = {
@@ -200,7 +205,7 @@ class AdvancedLogicEngine:
             hist["class_name"] = class_name
             seen_ids.add(track_id)
 
-            zone = self._find_zone(center)
+            zone = self._find_zone(zone_point)
             prev_zone = hist.get("current_zone")
             hist["current_zone"] = zone
             if zone:

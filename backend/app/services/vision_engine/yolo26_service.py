@@ -89,6 +89,7 @@ class Yolo26Service:
         scene_context: str | None = None,
         stream_protocol: str = "RTSP",
         zones: dict[str, list[list[float]]] | None = None,
+        zone_instructions: dict[str, str] | None = None,
     ) -> None:
         self.stop_all_running()
         self._reset_tracker()
@@ -105,6 +106,7 @@ class Yolo26Service:
             "scene_context": scene_context,
             "stream_protocol": stream_protocol,
             "zones": zones or {},
+            "zone_instructions": zone_instructions or {},
             "result": None,
             "error": None,
             "frames": 0,
@@ -118,6 +120,7 @@ class Yolo26Service:
             "analysis_buffer": [],
             "analysis": None,
             "zone_alerts": [],
+            "raw_zone_events": [],
             "risk_scores": deque(maxlen=5),
             "stop_event": Event(),
         }
@@ -298,19 +301,17 @@ class Yolo26Service:
 
         scene_text = logic_summary.get("scene_text", "")
         if "ZONE_INTRUSION" in scene_text:
-            alerts = job.get("zone_alerts")
-            if isinstance(alerts, list):
+            raw_buf = job.get("raw_zone_events")
+            if isinstance(raw_buf, list):
                 for line in scene_text.split("\n"):
                     if "ZONE_INTRUSION" in line:
-                        alert = {
-                            "type": "ZONE_INTRUSION",
+                        raw_buf.append({
                             "message": line.strip().lstrip("- "),
                             "frame": frame_index,
                             "timestamp": time(),
-                        }
-                        alerts.append(alert)
-                        if len(alerts) > 50:
-                            alerts.pop(0)
+                        })
+                        if len(raw_buf) > 30:
+                            raw_buf.pop(0)
 
         batch = job.get("batch")
         if isinstance(batch, list):
@@ -450,6 +451,96 @@ class Yolo26Service:
                 return False
         return True
 
+    _ZONE_JUDGE_PROMPT = (
+        "You are a zone alert filter for a CCTV system.\n"
+        "You will receive:\n"
+        "1. A list of ZONE RULES (user instructions per zone)\n"
+        "2. A list of raw ZONE EVENTS (objects entering zones)\n\n"
+        "Your task: decide which events MATCH a rule.\n"
+        "Return ONLY a JSON array of the event indices that match. "
+        "Example: [0, 2] means events at index 0 and 2 match a rule. "
+        "Return [] if none match.\n"
+        "Do NOT explain. Do NOT wrap in markdown. ONLY the JSON array."
+    )
+
+    def _judge_zone_events(self, job: dict) -> None:
+        """Send raw zone events to LLM to filter against user instructions."""
+        raw_events = job.get("raw_zone_events")
+        if not isinstance(raw_events, list) or not raw_events:
+            return
+        zone_instructions = job.get("zone_instructions")
+        if not zone_instructions or not isinstance(zone_instructions, dict):
+            return
+        active_instructions = {k: v for k, v in zone_instructions.items() if v}
+        if not active_instructions:
+            return
+
+        events_snapshot = list(raw_events)
+        raw_events.clear()
+
+        rules_text = "\n".join(
+            f"- Zone \"{name}\": {instr}" for name, instr in active_instructions.items()
+        )
+        events_text = "\n".join(
+            f"[{i}] {ev['message']}" for i, ev in enumerate(events_snapshot)
+        )
+
+        user_msg = f"ZONE RULES:\n{rules_text}\n\nZONE EVENTS:\n{events_text}"
+
+        try:
+            resp = self._analysis_client.post("/chat/completions", json={
+                "model": config.SCALWAY_ANALYSIS_MODEL,
+                "messages": [
+                    {"role": "system", "content": self._ZONE_JUDGE_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                "max_tokens": 100,
+                "temperature": 0.0,
+                "stream": False,
+            })
+            resp.raise_for_status()
+            content = (
+                resp.json().get("choices", [{}])[0]
+                .get("message", {})
+                .get("content")
+            ) or ""
+
+            import re
+            match = re.search(r'\[[\d\s,]*\]', content)
+            if not match:
+                logger.debug("zone_judge returned no array: %s", content[:100])
+                return
+
+            indices = json.loads(match.group())
+            if not isinstance(indices, list):
+                return
+
+            alerts = job.get("zone_alerts")
+            if not isinstance(alerts, list):
+                alerts = []
+                job["zone_alerts"] = alerts
+
+            for idx in indices:
+                if isinstance(idx, int) and 0 <= idx < len(events_snapshot):
+                    ev = events_snapshot[idx]
+                    alerts.append({
+                        "type": "ZONE_INTRUSION",
+                        "message": ev["message"],
+                        "frame": ev["frame"],
+                        "timestamp": ev["timestamp"],
+                    })
+                    if len(alerts) > 50:
+                        alerts.pop(0)
+
+            if indices:
+                logger.info(
+                    "zone_judge confirmed %d/%d events",
+                    len(indices), len(events_snapshot),
+                )
+
+        except Exception as exc:
+            logger.warning("zone_judge_failed: %s", exc)
+
     def _maybe_analyze(self, job: dict[str, object]) -> None:
         batch = job.get("last_event", {})
         if not isinstance(batch, dict):
@@ -469,6 +560,8 @@ class Yolo26Service:
                 )
         if texts:
             buffer.append("\n".join(texts))
+
+        self._judge_zone_events(job)
 
         calm = self._scene_is_calm(job)
 
@@ -492,6 +585,21 @@ class Yolo26Service:
                 f"\n\nSCENE CONTEXT (use this to judge what is normal vs suspicious):\n"
                 f"{scene_context}"
             )
+
+        zone_instructions = job.get("zone_instructions")
+        if zone_instructions and isinstance(zone_instructions, dict):
+            rules = []
+            for zname, instruction in zone_instructions.items():
+                if instruction:
+                    rules.append(f"- Zone \"{zname}\": {instruction}")
+            if rules:
+                system_prompt += (
+                    f"\n\nROI ZONE RULES (user-defined alerts for specific areas):\n"
+                    + "\n".join(rules)
+                    + "\nWhen a ZONE_INTRUSION event occurs for any of these zones, "
+                    "evaluate the rule and raise the risk_score accordingly."
+                )
+
         payload = {
             "model": config.SCALWAY_ANALYSIS_MODEL,
             "messages": [
