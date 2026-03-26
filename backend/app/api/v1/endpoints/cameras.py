@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -246,7 +247,12 @@ class _FrameGrabber:
                     reconnects, _RTMP_MAX_RECONNECTS, self._url,
                 )
                 time.sleep(_RTMP_RECONNECT_DELAY)
-                self._cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
+                saved = os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+                try:
+                    self._cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
+                finally:
+                    if saved is not None:
+                        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = saved
                 if not self._cap.isOpened():
                     self._cap.release()
                     logger.warning("grabber_rtmp_reconnect_failed url=%s", self._url)
@@ -298,9 +304,22 @@ def _encode_frame(frame: np.ndarray) -> bytes | None:
 # Live MJPEG streaming
 # ---------------------------------------------------------------------------
 
-def _open_capture(url: str) -> cv2.VideoCapture | None:
-    """Open an RTSP or RTMP stream via FFmpeg."""
-    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+def _open_capture(url: str, is_rtmp: bool = False) -> cv2.VideoCapture | None:
+    """Open an RTSP or RTMP stream via FFmpeg.
+
+    For RTMP, the global OPENCV_FFMPEG_CAPTURE_OPTIONS (which contains
+    RTSP-specific stimeout) is temporarily cleared to avoid corrupting
+    RTMP's listen_timeout parameter.
+    """
+    saved_opts = None
+    if is_rtmp:
+        saved_opts = os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+    try:
+        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    finally:
+        if saved_opts is not None:
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = saved_opts
+
     if not cap.isOpened():
         cap.release()
         logger.warning("camera_open_failed url=%s", url)
@@ -340,7 +359,7 @@ async def camera_live(
     loop = asyncio.get_event_loop()
     try:
         cap = await asyncio.wait_for(
-            loop.run_in_executor(_STREAM_POOL, _open_capture, stream_url),
+            loop.run_in_executor(_STREAM_POOL, _open_capture, stream_url, is_rtmp),
             timeout=_CONNECT_TIMEOUT_S + 2,
         )
     except asyncio.TimeoutError:
