@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
 import cv2
+import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -25,6 +27,8 @@ _MAX_CONSECUTIVE_DROPS = 30
 _CONNECT_TIMEOUT_S = 10
 _RTMP_RECONNECT_DELAY = 2.0
 _RTMP_MAX_RECONNECTS = 5
+_JPEG_QUALITY = 65
+_PREVIEW_MAX_WIDTH = 960
 _STREAM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mjpeg")
 
 
@@ -192,14 +196,110 @@ async def delete_camera(
 
 
 # ---------------------------------------------------------------------------
+# FrameGrabber -- drains the capture buffer in a tight loop so the
+# MJPEG generator always gets the latest frame with zero stale lag.
+# ---------------------------------------------------------------------------
+
+class _FrameGrabber:
+    """Daemon thread that continuously reads frames from a VideoCapture,
+    keeping only the most recent one.  For RTMP streams it also handles
+    reconnection internally.
+    """
+
+    def __init__(
+        self,
+        cap: cv2.VideoCapture,
+        url: str,
+        *,
+        is_rtmp: bool = False,
+    ) -> None:
+        self._cap = cap
+        self._url = url
+        self._is_rtmp = is_rtmp
+        self._frame: np.ndarray | None = None
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        consecutive_fails = 0
+        reconnects = 0
+
+        while not self._stop_event.is_set():
+            ret, frame = self._cap.read()
+            if not ret:
+                consecutive_fails += 1
+                if consecutive_fails < _MAX_CONSECUTIVE_DROPS:
+                    continue
+
+                if not self._is_rtmp:
+                    break
+
+                self._cap.release()
+                if reconnects >= _RTMP_MAX_RECONNECTS:
+                    logger.warning("grabber_rtmp_max_reconnects url=%s", self._url)
+                    break
+                reconnects += 1
+                logger.info(
+                    "grabber_rtmp_reconnecting attempt=%d/%d url=%s",
+                    reconnects, _RTMP_MAX_RECONNECTS, self._url,
+                )
+                time.sleep(_RTMP_RECONNECT_DELAY)
+                self._cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
+                if not self._cap.isOpened():
+                    self._cap.release()
+                    logger.warning("grabber_rtmp_reconnect_failed url=%s", self._url)
+                    continue
+                self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                consecutive_fails = 0
+                logger.info("grabber_rtmp_reconnected url=%s", self._url)
+                continue
+
+            consecutive_fails = 0
+            reconnects = 0
+            with self._lock:
+                self._frame = frame
+
+    def get_frame(self) -> np.ndarray | None:
+        with self._lock:
+            return self._frame
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._thread.join(timeout=3)
+        try:
+            self._cap.release()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Encoding helpers
+# ---------------------------------------------------------------------------
+
+def _encode_frame(frame: np.ndarray) -> bytes | None:
+    """Downscale if needed and JPEG-encode at preview quality."""
+    h, w = frame.shape[:2]
+    if w > _PREVIEW_MAX_WIDTH:
+        scale = _PREVIEW_MAX_WIDTH / w
+        frame = cv2.resize(
+            frame,
+            (int(w * scale), int(h * scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+    ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
+    if not ok or jpeg is None:
+        return None
+    return jpeg.tobytes()
+
+
+# ---------------------------------------------------------------------------
 # Live MJPEG streaming
 # ---------------------------------------------------------------------------
 
 def _open_capture(url: str) -> cv2.VideoCapture | None:
-    """Open an RTSP or RTMP stream via FFmpeg.
-
-    Runs in _STREAM_POOL so it never touches the async event loop.
-    """
+    """Open an RTSP or RTMP stream via FFmpeg."""
     cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         cap.release()
@@ -218,8 +318,8 @@ async def camera_live(
 ) -> StreamingResponse:
     """Stream live MJPEG from the camera. Auth via ?token=JWT.
 
-    Works for both RTSP and RTMP cameras. RTMP streams get automatic
-    reconnection when the push source drops temporarily.
+    Uses a FrameGrabber thread to always serve the latest frame,
+    eliminating OpenCV buffer lag for both RTSP and RTMP.
     """
     result = await db.execute(
         select(Camera).where(
@@ -256,35 +356,31 @@ async def camera_live(
             detail="Unable to connect to camera stream.",
         )
 
-    if is_rtmp:
-        gen = _mjpeg_generator_rtmp(cap, stream_url)
-    else:
-        gen = _mjpeg_generator(cap)
+    grabber = _FrameGrabber(cap, stream_url, is_rtmp=is_rtmp)
 
     return StreamingResponse(
-        gen,
+        _mjpeg_generator(grabber),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
-def _mjpeg_generator(cap: cv2.VideoCapture):
-    """Yield MJPEG frames from an already-connected RTSP capture."""
+def _mjpeg_generator(grabber: _FrameGrabber):
+    """Yield MJPEG frames from a FrameGrabber (always latest frame)."""
     interval = 1.0 / _LIVE_FPS
-    consecutive_drops = 0
+    empty_cycles = 0
 
     try:
-        while consecutive_drops < _MAX_CONSECUTIVE_DROPS:
-            ret, frame = cap.read()
-            if not ret:
-                consecutive_drops += 1
-                time.sleep(0.05)
+        while empty_cycles < _MAX_CONSECUTIVE_DROPS:
+            frame = grabber.get_frame()
+            if frame is None:
+                empty_cycles += 1
+                time.sleep(0.03)
                 continue
-            consecutive_drops = 0
+            empty_cycles = 0
 
-            _, jpeg = cv2.imencode(".jpg", frame)
-            if jpeg is None:
+            data = _encode_frame(frame)
+            if data is None:
                 continue
-            data = jpeg.tobytes()
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n"
@@ -294,62 +390,4 @@ def _mjpeg_generator(cap: cv2.VideoCapture):
             )
             time.sleep(interval)
     finally:
-        cap.release()
-
-
-def _mjpeg_generator_rtmp(cap: cv2.VideoCapture, url: str):
-    """Yield MJPEG frames from an RTMP capture with auto-reconnection.
-
-    RTMP push streams drop when the camera restarts or the network
-    hiccups.  Instead of ending the generator we wait and re-open
-    the capture up to _RTMP_MAX_RECONNECTS times.
-    """
-    interval = 1.0 / _LIVE_FPS
-    consecutive_drops = 0
-    reconnects = 0
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                consecutive_drops += 1
-                if consecutive_drops >= _MAX_CONSECUTIVE_DROPS:
-                    cap.release()
-                    if reconnects >= _RTMP_MAX_RECONNECTS:
-                        logger.warning("rtmp_max_reconnects url=%s", url)
-                        return
-                    reconnects += 1
-                    logger.info(
-                        "rtmp_reconnecting attempt=%d/%d url=%s",
-                        reconnects, _RTMP_MAX_RECONNECTS, url,
-                    )
-                    time.sleep(_RTMP_RECONNECT_DELAY)
-                    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-                    if not cap.isOpened():
-                        cap.release()
-                        logger.warning("rtmp_reconnect_failed url=%s", url)
-                        continue
-                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    consecutive_drops = 0
-                    logger.info("rtmp_reconnected url=%s", url)
-                    continue
-                time.sleep(0.05)
-                continue
-
-            consecutive_drops = 0
-            reconnects = 0
-
-            _, jpeg = cv2.imencode(".jpg", frame)
-            if jpeg is None:
-                continue
-            data = jpeg.tobytes()
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n"
-                + data
-                + b"\r\n"
-            )
-            time.sleep(interval)
-    finally:
-        cap.release()
+        grabber.stop()
