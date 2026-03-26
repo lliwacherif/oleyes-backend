@@ -221,7 +221,12 @@ class Yolo26Service:
                             break
                         _time.sleep(_RTMP_RECONNECT_DELAY)
 
-                    cap = cv2.VideoCapture(source_url, cv2.CAP_FFMPEG)
+                    saved_opts = os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+                    try:
+                        cap = cv2.VideoCapture(source_url, cv2.CAP_FFMPEG)
+                    finally:
+                        if saved_opts is not None:
+                            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = saved_opts
                     if not cap.isOpened():
                         cap.release()
                         cap = None
