@@ -28,8 +28,7 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault(
     "OPENCV_FFMPEG_CAPTURE_OPTIONS",
     "timeout;120000000|reconnect;1|reconnect_streamed;1|reconnect_delay_max;30"
-    "|stimeout;10000000"
-    "|fflags;nobuffer",
+    "|stimeout;10000000",
 )
 
 
