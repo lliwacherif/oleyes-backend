@@ -138,6 +138,11 @@ async def start_rtsp_detection(
             scene_context = sc.refined_text
 
     zones, zone_instructions = await _load_zones(request.camera_id, db)
+    import logging as _log
+    _log.getLogger(__name__).info(
+        "detect_rtsp camera_id=%s zones=%d instructions=%s",
+        request.camera_id, len(zones), list(zone_instructions.keys()) if zone_instructions else "none",
+    )
     job_id = str(uuid4())
     _service.register_job(
         job_id=job_id,
@@ -173,6 +178,11 @@ async def start_rtmp_detection(
             scene_context = sc.refined_text
 
     zones, zone_instructions = await _load_zones(request.camera_id, db)
+    import logging as _log
+    _log.getLogger(__name__).info(
+        "detect_rtmp camera_id=%s zones=%d instructions=%s",
+        request.camera_id, len(zones), list(zone_instructions.keys()) if zone_instructions else "none",
+    )
     base = config.RTMP_BASE_URL.rstrip("/")
     rtmp_url = f"{base}/{request.stream_key}"
     job_id = str(uuid4())

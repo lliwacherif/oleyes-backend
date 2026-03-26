@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from time import time
@@ -7,6 +8,8 @@ from typing import Any, Iterable
 
 import numpy as np
 from shapely.geometry import Point, Polygon, box
+
+_logger = logging.getLogger(__name__)
 
 # ── COCO-80 class ID → human-readable name ──────────────────────────
 COCO_NAMES: dict[int, str] = {
@@ -206,6 +209,14 @@ class AdvancedLogicEngine:
             seen_ids.add(track_id)
 
             zone = self._find_zone(zone_point)
+            if class_id in self._person_class_ids and self._zones and frame_index % 20 == 0:
+                _logger.info(
+                    "zone_check Person#%d bbox=[%.0f,%.0f,%.0f,%.0f] zone_point=(%.0f,%.0f) zones=%s result=%s",
+                    track_id, bbox[0], bbox[1], bbox[2], bbox[3],
+                    zone_point[0], zone_point[1],
+                    {n: [(int(c[0]), int(c[1])) for c in list(p.exterior.coords)[:3]] for n, p in self._zones.items()},
+                    zone,
+                )
             prev_zone = hist.get("current_zone")
             hist["current_zone"] = zone
             if zone:

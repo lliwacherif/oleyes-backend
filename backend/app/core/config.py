@@ -40,6 +40,7 @@ SCALWAY_ANALYSIS_PRESENCE_PENALTY = float(
 )
 
 YOLO_MODEL = get_env("YOLO_MODEL", "yolo26n.pt")
+YOLO_POSE_MODEL = get_env("YOLO_POSE_MODEL", "yolo26n-pose.pt")
 YOLO_DEVICE = get_env("YOLO_DEVICE", "cpu")
 YOLO_CONF = float(get_env("YOLO_CONF", "0.25"))
 YOLO_MAX_DETECTIONS = int(get_env("YOLO_MAX_DETECTIONS", "100"))

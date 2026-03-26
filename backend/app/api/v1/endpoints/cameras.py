@@ -6,6 +6,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 
+import json as _json
+
 import cv2
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -13,7 +15,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from ultralytics import YOLO
 
+from app.core import config
 from app.core.database import get_db
 from app.core.deps import get_current_user, get_current_user_from_query_token
 from app.models.user import User
@@ -29,8 +33,22 @@ _CONNECT_TIMEOUT_S = 10
 _RTMP_RECONNECT_DELAY = 2.0
 _RTMP_MAX_RECONNECTS = 5
 _JPEG_QUALITY = 65
-_PREVIEW_MAX_WIDTH = 960
+_SKELETON_FPS = 10
 _STREAM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mjpeg")
+
+_pose_model: YOLO | None = None
+_pose_model_lock = threading.Lock()
+
+
+def _get_pose_model() -> YOLO:
+    global _pose_model
+    if _pose_model is not None:
+        return _pose_model
+    with _pose_model_lock:
+        if _pose_model is None:
+            _pose_model = YOLO(config.YOLO_POSE_MODEL)
+            logger.info("pose_model_loaded model=%s", config.YOLO_POSE_MODEL)
+    return _pose_model
 
 
 class StreamProtocol(str, Enum):
@@ -285,15 +303,8 @@ class _FrameGrabber:
 # ---------------------------------------------------------------------------
 
 def _encode_frame(frame: np.ndarray) -> bytes | None:
-    """Downscale if needed and JPEG-encode at preview quality."""
-    h, w = frame.shape[:2]
-    if w > _PREVIEW_MAX_WIDTH:
-        scale = _PREVIEW_MAX_WIDTH / w
-        frame = cv2.resize(
-            frame,
-            (int(w * scale), int(h * scale)),
-            interpolation=cv2.INTER_AREA,
-        )
+    """JPEG-encode at preview quality. No downscale -- zone coordinates
+    must match the YOLO detection coordinate space (original resolution)."""
     ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
     if not ok or jpeg is None:
         return None
@@ -410,3 +421,125 @@ def _mjpeg_generator(grabber: _FrameGrabber):
             time.sleep(interval)
     finally:
         grabber.stop()
+
+
+# ---------------------------------------------------------------------------
+# Skeleton / Pose SSE endpoint
+# ---------------------------------------------------------------------------
+
+COCO_KEYPOINT_NAMES = [
+    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist", "left_hip", "right_hip",
+    "left_knee", "right_knee", "left_ankle", "right_ankle",
+]
+
+
+@router.get("/{camera_id}/skeleton")
+async def camera_skeleton(
+    camera_id: str,
+    current_user: User = Depends(get_current_user_from_query_token),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """SSE stream of pose keypoints for all detected persons.
+
+    The frontend draws the skeleton overlay on top of the live MJPEG
+    stream using SVG. Auth via ?token=JWT.
+    """
+    result = await db.execute(
+        select(Camera).where(
+            Camera.id == camera_id,
+            Camera.user_id == current_user.id,
+        )
+    )
+    cam = result.scalar_one_or_none()
+    if not cam:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Camera not found.")
+
+    stream_url = cam.effective_url()
+    is_rtmp = cam.stream_protocol == "RTMP"
+
+    loop = asyncio.get_event_loop()
+    try:
+        cap = await asyncio.wait_for(
+            loop.run_in_executor(_STREAM_POOL, _open_capture, stream_url, is_rtmp),
+            timeout=_CONNECT_TIMEOUT_S + 2,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Camera connection timed out.")
+
+    if cap is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Unable to connect to camera stream.")
+
+    grabber = _FrameGrabber(cap, stream_url, is_rtmp=is_rtmp)
+
+    async def skeleton_stream():
+        interval = 1.0 / _SKELETON_FPS
+        frame_idx = 0
+        model = _get_pose_model()
+
+        try:
+            empty_cycles = 0
+            while empty_cycles < _MAX_CONSECUTIVE_DROPS:
+                frame = grabber.get_frame()
+                if frame is None:
+                    empty_cycles += 1
+                    await asyncio.sleep(0.03)
+                    continue
+                empty_cycles = 0
+                frame_idx += 1
+
+                try:
+                    results = model.track(
+                        source=frame,
+                        conf=config.YOLO_CONF,
+                        device=config.YOLO_DEVICE,
+                        verbose=False,
+                        persist=True,
+                    )
+                except Exception as exc:
+                    logger.warning("skeleton_inference_error: %s", exc)
+                    await asyncio.sleep(interval)
+                    continue
+
+                persons = []
+                if results and len(results) > 0:
+                    r = results[0]
+                    boxes = r.boxes
+                    kpts = getattr(r, "keypoints", None)
+
+                    if boxes is not None and kpts is not None and kpts.data is not None:
+                        kpts_data = kpts.data
+                        for i, box in enumerate(boxes):
+                            cls_id = int(box.cls.item()) if box.cls is not None else -1
+                            if cls_id != 0:
+                                continue
+                            track_id = int(box.id.item()) if getattr(box, "id", None) is not None else -1
+                            xyxy = [round(float(v), 1) for v in box.xyxy.tolist()[0]]
+
+                            if i < len(kpts_data):
+                                person_kpts = kpts_data[i]
+                                keypoints = []
+                                for ki in range(len(person_kpts)):
+                                    kp = person_kpts[ki]
+                                    x = round(float(kp[0]), 1)
+                                    y = round(float(kp[1]), 1)
+                                    c = round(float(kp[2]), 2) if len(kp) > 2 else 0.0
+                                    keypoints.append({"x": x, "y": y, "conf": c})
+
+                                persons.append({
+                                    "track_id": track_id,
+                                    "bbox": xyxy,
+                                    "keypoints": keypoints,
+                                })
+
+                payload = _json.dumps({
+                    "persons": persons,
+                    "frame_index": frame_idx,
+                })
+                yield f"data: {payload}\n\n"
+                await asyncio.sleep(interval)
+        finally:
+            grabber.stop()
+
+    return StreamingResponse(skeleton_stream(), media_type="text/event-stream")

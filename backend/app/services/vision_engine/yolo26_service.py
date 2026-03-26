@@ -470,10 +470,13 @@ class Yolo26Service:
             return
         zone_instructions = job.get("zone_instructions")
         if not zone_instructions or not isinstance(zone_instructions, dict):
+            logger.debug("zone_judge skip: no zone_instructions in job")
             return
         active_instructions = {k: v for k, v in zone_instructions.items() if v}
         if not active_instructions:
+            logger.debug("zone_judge skip: all instructions empty")
             return
+        logger.info("zone_judge processing %d raw events, %d rules", len(raw_events), len(active_instructions))
 
         events_snapshot = list(raw_events)
         raw_events.clear()
@@ -506,9 +509,10 @@ class Yolo26Service:
             ) or ""
 
             import re
+            logger.info("zone_judge LLM response: %s", content[:150])
             match = re.search(r'\[[\d\s,]*\]', content)
             if not match:
-                logger.debug("zone_judge returned no array: %s", content[:100])
+                logger.warning("zone_judge returned no array: %s", content[:100])
                 return
 
             indices = json.loads(match.group())
