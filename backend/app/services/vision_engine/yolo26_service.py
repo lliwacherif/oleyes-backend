@@ -456,99 +456,109 @@ class Yolo26Service:
                 return False
         return True
 
-    _ZONE_JUDGE_PROMPT = (
-        "You are a zone alert filter for a CCTV system.\n"
-        "You will receive:\n"
-        "1. A list of ZONE RULES (user instructions per zone)\n"
-        "2. A list of raw ZONE EVENTS (objects entering zones)\n\n"
-        "Your task: decide which events MATCH a rule.\n"
-        "Return ONLY a JSON array of the event indices that match. "
-        "Example: [0, 2] means events at index 0 and 2 match a rule. "
-        "Return [] if none match.\n"
-        "Do NOT explain. Do NOT wrap in markdown. ONLY the JSON array."
-    )
+    _OBJECT_KEYWORDS: dict[str, list[str]] = {
+        "person": ["person", "people", "someone", "anybody", "human", "man", "woman", "child", "enter", "entered"],
+        "car": ["car", "vehicle", "automobile"],
+        "truck": ["truck"],
+        "bicycle": ["bicycle", "bike", "cyclist"],
+        "motorcycle": ["motorcycle", "motorbike"],
+        "dog": ["dog"],
+        "cat": ["cat"],
+        "phone": ["phone", "cell phone", "cellphone", "mobile"],
+        "laptop": ["laptop", "computer"],
+        "backpack": ["backpack", "bag"],
+        "handbag": ["handbag", "purse"],
+        "suitcase": ["suitcase", "luggage"],
+    }
 
     def _judge_zone_events(self, job: dict) -> None:
-        """Send raw zone events to LLM to filter against user instructions."""
+        """Filter raw zone events against user instructions via keyword matching.
+
+        Rules:
+        - No instructions → pass ALL events (every zone entry is an alert)
+        - Has instructions → match the object type in the event against keywords
+          extracted from the instruction text
+        - "person" keywords also match generic instructions like "alert when entered"
+        """
         raw_events = job.get("raw_zone_events")
         if not isinstance(raw_events, list) or not raw_events:
             return
-        zone_instructions = job.get("zone_instructions")
-        if not zone_instructions or not isinstance(zone_instructions, dict):
-            logger.debug("zone_judge skip: no zone_instructions in job")
-            return
-        active_instructions = {k: v for k, v in zone_instructions.items() if v}
-        if not active_instructions:
-            logger.debug("zone_judge skip: all instructions empty")
-            return
-        logger.info("zone_judge processing %d raw events, %d rules", len(raw_events), len(active_instructions))
 
         events_snapshot = list(raw_events)
         raw_events.clear()
 
-        rules_text = "\n".join(
-            f"- Zone \"{name}\": {instr}" for name, instr in active_instructions.items()
-        )
-        events_text = "\n".join(
-            f"[{i}] {ev['message']}" for i, ev in enumerate(events_snapshot)
+        zone_instructions = job.get("zone_instructions") or {}
+        has_instructions = isinstance(zone_instructions, dict) and any(
+            v.strip() for v in zone_instructions.values()
         )
 
-        user_msg = f"ZONE RULES:\n{rules_text}\n\nZONE EVENTS:\n{events_text}"
+        alerts = job.get("zone_alerts")
+        if not isinstance(alerts, list):
+            alerts = []
+            job["zone_alerts"] = alerts
 
-        try:
-            resp = self._analysis_client.post("/chat/completions", json={
-                "model": config.SCALWAY_ANALYSIS_MODEL,
-                "messages": [
-                    {"role": "system", "content": self._ZONE_JUDGE_PROMPT},
-                    {"role": "user", "content": user_msg},
-                ],
-                "max_tokens": 100,
-                "temperature": 0.0,
-                "stream": False,
-            })
-            resp.raise_for_status()
-            content = (
-                resp.json().get("choices", [{}])[0]
-                .get("message", {})
-                .get("content")
-            ) or ""
+        accepted = 0
+        for ev in events_snapshot:
+            msg = ev.get("message", "")
 
-            import re
-            logger.info("zone_judge LLM response: %s", content[:150])
-            match = re.search(r'\[[\d\s,]*\]', content)
-            if not match:
-                logger.warning("zone_judge returned no array: %s", content[:100])
-                return
+            if not has_instructions:
+                self._append_zone_alert(alerts, ev)
+                accepted += 1
+                continue
 
-            indices = json.loads(match.group())
-            if not isinstance(indices, list):
-                return
+            import re as _re
+            zm = _re.search(r"zone '([^']+)'", msg)
+            zone_name = zm.group(1) if zm else ""
 
-            alerts = job.get("zone_alerts")
-            if not isinstance(alerts, list):
-                alerts = []
-                job["zone_alerts"] = alerts
+            instruction = (zone_instructions.get(zone_name, "") or "").lower()
+            if not instruction:
+                all_instructions = " ".join(v for v in zone_instructions.values() if v)
+                instruction = all_instructions.lower()
 
-            for idx in indices:
-                if isinstance(idx, int) and 0 <= idx < len(events_snapshot):
-                    ev = events_snapshot[idx]
-                    alerts.append({
-                        "type": "ZONE_INTRUSION",
-                        "message": ev["message"],
-                        "frame": ev["frame"],
-                        "timestamp": ev["timestamp"],
-                    })
-                    if len(alerts) > 50:
-                        alerts.pop(0)
+            if not instruction:
+                self._append_zone_alert(alerts, ev)
+                accepted += 1
+                continue
 
-            if indices:
-                logger.info(
-                    "zone_judge confirmed %d/%d events",
-                    len(indices), len(events_snapshot),
+            obj_in_event = msg.split(":")[0].rsplit(" ", 1)[-1].lower() if ":" in msg else ""
+            obj_in_event = obj_in_event.replace("zone_intrusion", "").strip()
+            name_part = msg.split("#")[0].strip().lower()
+            for part in ["zone_intrusion:", "zone_intrusion"]:
+                name_part = name_part.replace(part, "").strip()
+
+            matched = False
+            for obj_type, keywords in self._OBJECT_KEYWORDS.items():
+                instruction_mentions = any(kw in instruction for kw in keywords)
+                event_has_object = (
+                    obj_type in name_part
+                    or any(kw in name_part for kw in keywords)
                 )
+                if instruction_mentions and event_has_object:
+                    matched = True
+                    break
 
-        except Exception as exc:
-            logger.warning("zone_judge_failed: %s", exc)
+            if not matched:
+                generic_triggers = ["any", "all", "everything", "anything"]
+                if any(t in instruction for t in generic_triggers):
+                    matched = True
+
+            if matched:
+                self._append_zone_alert(alerts, ev)
+                accepted += 1
+
+        if accepted:
+            logger.info("zone_filter passed %d/%d events", accepted, len(events_snapshot))
+
+    @staticmethod
+    def _append_zone_alert(alerts: list, ev: dict) -> None:
+        alerts.append({
+            "type": "ZONE_INTRUSION",
+            "message": ev.get("message", ""),
+            "frame": ev.get("frame", 0),
+            "timestamp": ev.get("timestamp", 0),
+        })
+        if len(alerts) > 50:
+            del alerts[:-50]
 
     def _maybe_analyze(self, job: dict[str, object]) -> None:
         batch = job.get("last_event", {})
