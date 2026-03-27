@@ -105,6 +105,21 @@ class AdvancedLogicEngine:
             "timestamp": 0.0,
         }
 
+    def reset(self) -> None:
+        """Clear all state for a fresh job start."""
+        self._history.clear()
+        self._event_log.clear()
+        self._timeline.clear()
+        self._event_counts.clear()
+        self._frame_index = 0
+        self._last_timestamp = None
+        self._scene_state = {
+            "objects": [],
+            "scene_text": "",
+            "frame_index": 0,
+            "timestamp": 0.0,
+        }
+
     def set_zones(self, zones: dict[str, Iterable[Iterable[float]]]) -> None:
         """Replace active zones at runtime (e.g. when a new job starts)."""
         self._zones = {name: Polygon(points) for name, points in zones.items()}

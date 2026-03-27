@@ -95,6 +95,7 @@ class Yolo26Service:
         self.stop_all_running()
         self._reset_tracker()
 
+        self._logic.reset()
         if zones:
             self._logic.set_zones(zones)
             logger.info("roi_zones_loaded count=%d names=%s", len(zones), list(zones.keys()))
