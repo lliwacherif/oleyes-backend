@@ -317,6 +317,7 @@ class Yolo26Service:
                         })
                         if len(raw_buf) > 30:
                             raw_buf.pop(0)
+                self._judge_zone_events(job)
 
         batch = job.get("batch")
         if isinstance(batch, list):
@@ -579,8 +580,6 @@ class Yolo26Service:
                 )
         if texts:
             buffer.append("\n".join(texts))
-
-        self._judge_zone_events(job)
 
         calm = self._scene_is_calm(job)
 
