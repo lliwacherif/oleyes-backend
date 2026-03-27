@@ -90,6 +90,7 @@ class Yolo26Service:
         stream_protocol: str = "RTSP",
         zones: dict[str, list[list[float]]] | None = None,
         zone_instructions: dict[str, str] | None = None,
+        security_priorities: dict[str, bool] | None = None,
     ) -> None:
         self.stop_all_running()
         self._reset_tracker()
@@ -100,6 +101,13 @@ class Yolo26Service:
         else:
             self._logic.set_zones({})
 
+        sp = security_priorities or {}
+        theft_on = sp.get("theft_detection", True)
+        self._logic.theft_detection_enabled = theft_on
+        logger.info("security_priorities theft=%s fire=%s fall=%s violence=%s analytics=%s",
+                     theft_on, sp.get("fire_detection"), sp.get("person_fall_detection"),
+                     sp.get("violence_detection"), sp.get("customer_behavior_analytics"))
+
         self._jobs[job_id] = {
             "status": "queued",
             "source_url": source_url,
@@ -107,6 +115,7 @@ class Yolo26Service:
             "stream_protocol": stream_protocol,
             "zones": zones or {},
             "zone_instructions": zone_instructions or {},
+            "security_priorities": sp,
             "result": None,
             "error": None,
             "frames": 0,
@@ -564,6 +573,90 @@ class Yolo26Service:
         if len(alerts) > 50:
             del alerts[:-50]
 
+    def _build_dynamic_prompt(self, job: dict) -> str:
+        """Build the LLM system prompt based on the user's security priorities."""
+        sp = job.get("security_priorities") or {}
+
+        base = (
+            "You are an AI CCTV analyst. Analyze the scene data and respond ONLY with valid JSON:\n"
+            '{"risk_score": 0-100, "risk_level": "LOW"|"MEDIUM"|"HIGH", '
+            '"label": "2-5 word title", "explanation": "1 sentence max 20 words"}\n\n'
+        )
+
+        rules = []
+        if sp.get("theft_detection", False):
+            rules.append(
+                "THEFT: If a Person overlaps an Item and the Item disappears "
+                "while the Person moves away, that is HIGH risk theft."
+            )
+        else:
+            rules.append(
+                "THEFT: Theft detection is DISABLED. Do NOT flag theft, "
+                "concealment, or disappearing objects. Ignore DISAPPEARED alerts."
+            )
+
+        if sp.get("violence_detection", False):
+            rules.append(
+                "VIOLENCE: If two Persons are Nearby and one has high speed, "
+                "erratic movement, or fighting indicators = HIGH risk."
+            )
+        else:
+            rules.append(
+                "VIOLENCE: Violence detection is DISABLED. Do NOT flag fighting "
+                "or aggression."
+            )
+
+        if sp.get("person_fall_detection", False):
+            rules.append(
+                "FALL: If a Person's bounding box suddenly changes from tall/narrow "
+                "to wide/short (aspect ratio shift), or speed drops to 0 after fast "
+                "movement, flag as possible fall = HIGH risk."
+            )
+
+        if sp.get("fire_detection", False):
+            rules.append(
+                "FIRE: If fire, smoke, or flames are detected in the scene = HIGH risk."
+            )
+
+        if sp.get("customer_behavior_analytics", False):
+            rules.append(
+                "ANALYTICS: Note customer flow patterns, dwell times, and crowding. "
+                "Normal customer movement is LOW risk."
+            )
+
+        if not any(sp.get(k, False) for k in sp):
+            rules.append(
+                "GENERAL: Monitor for unusual activity. "
+                "Normal movement of people and objects is LOW risk."
+            )
+
+        base += "RULES:\n" + "\n".join(f"  {i+1}) {r}" for i, r in enumerate(rules))
+
+        base += (
+            "\n\nIMPORTANT: Only flag events that match the ENABLED rules above. "
+            "If a rule is DISABLED, you MUST give it LOW risk and a neutral label. "
+            "A person simply standing near objects is NORMAL, not theft. "
+            "Objects leaving the frame or becoming occluded is NORMAL, not theft."
+        )
+
+        scene_context = job.get("scene_context")
+        if scene_context:
+            base += f"\n\nSCENE CONTEXT:\n{scene_context}"
+
+        zone_instructions = job.get("zone_instructions")
+        if zone_instructions and isinstance(zone_instructions, dict):
+            zone_rules = [
+                f"- Zone \"{n}\": {instr}"
+                for n, instr in zone_instructions.items() if instr
+            ]
+            if zone_rules:
+                base += (
+                    "\n\nROI ZONE RULES:\n"
+                    + "\n".join(zone_rules)
+                )
+
+        return base
+
     def _maybe_analyze(self, job: dict[str, object]) -> None:
         batch = job.get("last_event", {})
         if not isinstance(batch, dict):
@@ -599,27 +692,7 @@ class Yolo26Service:
             return
 
         combined = "\n\n".join(buffer[-2:])
-        system_prompt = config.SCALWAY_SYSTEM_PROMPT or ""
-        scene_context = job.get("scene_context")
-        if scene_context:
-            system_prompt += (
-                f"\n\nSCENE CONTEXT (use this to judge what is normal vs suspicious):\n"
-                f"{scene_context}"
-            )
-
-        zone_instructions = job.get("zone_instructions")
-        if zone_instructions and isinstance(zone_instructions, dict):
-            rules = []
-            for zname, instruction in zone_instructions.items():
-                if instruction:
-                    rules.append(f"- Zone \"{zname}\": {instruction}")
-            if rules:
-                system_prompt += (
-                    f"\n\nROI ZONE RULES (user-defined alerts for specific areas):\n"
-                    + "\n".join(rules)
-                    + "\nWhen a ZONE_INTRUSION event occurs for any of these zones, "
-                    "evaluate the rule and raise the risk_score accordingly."
-                )
+        system_prompt = self._build_dynamic_prompt(job)
 
         payload = {
             "model": config.SCALWAY_ANALYSIS_MODEL,

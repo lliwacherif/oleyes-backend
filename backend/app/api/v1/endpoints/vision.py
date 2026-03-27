@@ -14,11 +14,29 @@ from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.user import User
 from app.models.scene_context import SceneContext
+from app.models.user_context import UserContext
 from app.models.zone import Zone
 from app.services.vision_engine.yolo26_service import Yolo26Service
 
 router = APIRouter(prefix="/vision")
 _service = Yolo26Service()
+
+
+async def _load_security_priorities(user_id, db: AsyncSession) -> dict[str, bool]:
+    """Load the user's security priority toggles from UserContext."""
+    result = await db.execute(
+        select(UserContext).where(UserContext.user_id == user_id)
+    )
+    ctx = result.scalar_one_or_none()
+    if not ctx:
+        return {}
+    return {
+        "theft_detection": ctx.theft_detection,
+        "fire_detection": ctx.fire_detection,
+        "person_fall_detection": ctx.person_fall_detection,
+        "violence_detection": ctx.violence_detection,
+        "customer_behavior_analytics": ctx.customer_behavior_analytics,
+    }
 
 
 async def _load_zones(camera_id: str | None, db: AsyncSession) -> tuple[
@@ -138,11 +156,7 @@ async def start_rtsp_detection(
             scene_context = sc.refined_text
 
     zones, zone_instructions = await _load_zones(request.camera_id, db)
-    import logging as _log
-    _log.getLogger(__name__).info(
-        "detect_rtsp camera_id=%s zones=%d instructions=%s",
-        request.camera_id, len(zones), list(zone_instructions.keys()) if zone_instructions else "none",
-    )
+    priorities = await _load_security_priorities(current_user.id, db)
     job_id = str(uuid4())
     _service.register_job(
         job_id=job_id,
@@ -150,6 +164,7 @@ async def start_rtsp_detection(
         scene_context=scene_context,
         zones=zones or None,
         zone_instructions=zone_instructions or None,
+        security_priorities=priorities or None,
     )
     background_tasks.add_task(
         _service.start_job, job_id=job_id, source_url=request.rtsp_url
@@ -178,11 +193,7 @@ async def start_rtmp_detection(
             scene_context = sc.refined_text
 
     zones, zone_instructions = await _load_zones(request.camera_id, db)
-    import logging as _log
-    _log.getLogger(__name__).info(
-        "detect_rtmp camera_id=%s zones=%d instructions=%s",
-        request.camera_id, len(zones), list(zone_instructions.keys()) if zone_instructions else "none",
-    )
+    priorities = await _load_security_priorities(current_user.id, db)
     base = config.RTMP_BASE_URL.rstrip("/")
     rtmp_url = f"{base}/{request.stream_key}"
     job_id = str(uuid4())
@@ -193,6 +204,7 @@ async def start_rtmp_detection(
         stream_protocol="RTMP",
         zones=zones or None,
         zone_instructions=zone_instructions or None,
+        security_priorities=priorities or None,
     )
     background_tasks.add_task(
         _service.start_job, job_id=job_id, source_url=rtmp_url

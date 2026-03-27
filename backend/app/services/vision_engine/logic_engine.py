@@ -90,6 +90,8 @@ class AdvancedLogicEngine:
             "cell phone", "phone", "book", "purse", "wallet",
         }
 
+        self.theft_detection_enabled: bool = True
+
         # Event log — rolling buffer of alerts for the LLM
         self._event_log: deque[str] = deque(maxlen=20)
 
@@ -296,6 +298,10 @@ class AdvancedLogicEngine:
             last_class_id = hist.get("class_id", -1)
             last_class_name = hist.get("class_name") or _resolve_class_name(last_class_id, None)
             last_close_to = hist.get("last_close_to", [])
+
+            if not self.theft_detection_enabled:
+                del self._history[track_id]
+                continue
 
             is_stealable = (
                 last_class_id in self._stealable_class_ids
