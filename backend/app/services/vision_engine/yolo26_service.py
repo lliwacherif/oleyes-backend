@@ -409,8 +409,11 @@ class Yolo26Service:
             "detail": detail,
             "logic": job.get("logic"),
             "analysis": job.get("analysis"),
-            "zone_alerts": job.get("zone_alerts", []),
+            "zone_alerts": list(job.get("zone_alerts", [])),
         }
+        alerts = job.get("zone_alerts")
+        if isinstance(alerts, list) and alerts:
+            alerts.clear()
 
     def _is_stopped(self, job: dict[str, object]) -> bool:
         stop_event = job.get("stop_event")
