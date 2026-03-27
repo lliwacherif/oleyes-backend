@@ -375,12 +375,13 @@ class AdvancedLogicEngine:
 
         parts: list[str] = []
 
-        # --- Section 1: Events (disappearances, concealment alerts) ---
+        # --- Section 1: Events (disappearances, zone intrusions) ---
         if self._event_log:
             parts.append("EVENTS:")
             for evt in self._event_log:
                 parts.append(f"  - {evt}")
             parts.append("")
+            self._event_log.clear()
 
         # --- Section 2: Timeline (sliding window of recent states) ---
         if len(self._timeline) > 1:
