@@ -1029,11 +1029,25 @@ class Yolo26Service:
             buffer = []
             job["analysis_buffer"] = buffer
         texts = []
-        for frame in frames:
-            if isinstance(frame, dict) and frame.get("scene_text"):
-                texts.append(
-                    f"Frame {frame.get('frame_index')}: {frame.get('scene_text')}"
-                )
+        last_idx = len(frames) - 1
+        for i, frame in enumerate(frames):
+            if not isinstance(frame, dict) or not frame.get("scene_text"):
+                continue
+            raw = frame["scene_text"]
+            if i < last_idx:
+                lines = raw.split("\n")
+                current_only = []
+                in_current = False
+                for line in lines:
+                    if line.startswith("EVENTS:") or line.startswith("  - "):
+                        current_only.append(line)
+                        continue
+                    if line.startswith("CURRENT STATE:"):
+                        in_current = True
+                    if in_current:
+                        current_only.append(line)
+                raw = "\n".join(current_only) if current_only else raw
+            texts.append(f"Frame {frame.get('frame_index')}: {raw}")
         if texts:
             buffer.append("\n".join(texts))
 
