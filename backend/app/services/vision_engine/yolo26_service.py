@@ -223,7 +223,7 @@ class Yolo26Service:
                     job["finished_at"] = time()
                     break
                 pose_result = None
-                if pose_mode and pose_model is not None:
+                if pose_mode and pose_model is not None and self._should_run_pose(result):
                     frame_img = getattr(result, "orig_img", None)
                     if frame_img is not None:
                         pose_results = pose_model.predict(
@@ -301,7 +301,7 @@ class Yolo26Service:
                 )
                 if results:
                     pose_result = None
-                    if job.get("pose_theft_mode"):
+                    if job.get("pose_theft_mode") and self._should_run_pose(results[0]):
                         pose_results = self._get_pose_model().predict(
                             frame, conf=0.5,
                             device=config.YOLO_DEVICE, verbose=False,
@@ -324,14 +324,54 @@ class Yolo26Service:
     # Shared helpers for frame processing
     # ------------------------------------------------------------------
 
-    _POSE_MATCH_PX = 50.0
+    _STEALABLE_CLS = {24, 26, 28, 63, 67, 73}
+    _POSE_GATE_PX = 150.0
+
+    @staticmethod
+    def _should_run_pose(std_result) -> bool:
+        """Return True only if the frame has a person within proximity of a stealable item."""
+        import numpy as _np
+        boxes = getattr(std_result, "boxes", None)
+        if boxes is None or boxes.xyxy is None:
+            return False
+        person_centers = []
+        item_centers = []
+        for b in boxes:
+            cls_id = int(b.cls.item()) if b.cls is not None else -1
+            xyxy = b.xyxy.tolist()[0]
+            cx = (xyxy[0] + xyxy[2]) / 2.0
+            cy = (xyxy[1] + xyxy[3]) / 2.0
+            if cls_id == 0:
+                person_centers.append((cx, cy))
+            elif cls_id in Yolo26Service._STEALABLE_CLS:
+                item_centers.append((cx, cy))
+        if not person_centers or not item_centers:
+            return False
+        for pcx, pcy in person_centers:
+            for icx, icy in item_centers:
+                if _np.hypot(pcx - icx, pcy - icy) < Yolo26Service._POSE_GATE_PX:
+                    return True
+        return False
+
+    _POSE_IOU_THRESH = 0.60
+
+    @staticmethod
+    def _iou(a: list[float], b: list[float]) -> float:
+        """Intersection over Union of two [x1, y1, x2, y2] boxes."""
+        ix1 = max(a[0], b[0])
+        iy1 = max(a[1], b[1])
+        ix2 = min(a[2], b[2])
+        iy2 = min(a[3], b[3])
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
 
     @staticmethod
     def _merge_pose_keypoints(std_boxes, pose_result) -> dict[int, list]:
         """Map keypoints from a separate pose prediction to the tracked
-        person boxes from the standard model using nearest-center matching."""
-        import numpy as _np
-
+        person boxes from the standard model using IoU-based matching."""
         if std_boxes is None or std_boxes.xyxy is None:
             return {}
 
@@ -340,17 +380,14 @@ class Yolo26Service:
         if pose_boxes is None or pose_kpts is None or pose_kpts.data is None:
             return {}
 
-        pose_centers = []
+        pose_bboxes = []
         pose_kpts_data = pose_kpts.data
         for i, pb in enumerate(pose_boxes):
             if i >= len(pose_kpts_data):
                 break
-            pxyxy = pb.xyxy.tolist()[0]
-            pcx = (pxyxy[0] + pxyxy[2]) / 2.0
-            pcy = (pxyxy[1] + pxyxy[3]) / 2.0
-            pose_centers.append((pcx, pcy, i))
+            pose_bboxes.append((pb.xyxy.tolist()[0], i))
 
-        if not pose_centers:
+        if not pose_bboxes:
             return {}
 
         keypoints_map: dict[int, list] = {}
@@ -364,20 +401,18 @@ class Yolo26Service:
             if track_id == -1:
                 continue
             sxyxy = sb.xyxy.tolist()[0]
-            scx = (sxyxy[0] + sxyxy[2]) / 2.0
-            scy = (sxyxy[1] + sxyxy[3]) / 2.0
 
-            best_dist = float("inf")
+            best_iou = 0.0
             best_idx = -1
-            for pcx, pcy, pidx in pose_centers:
+            for pxyxy, pidx in pose_bboxes:
                 if pidx in used_pose:
                     continue
-                d = _np.hypot(scx - pcx, scy - pcy)
-                if d < best_dist:
-                    best_dist = d
+                score = Yolo26Service._iou(sxyxy, pxyxy)
+                if score > best_iou:
+                    best_iou = score
                     best_idx = pidx
 
-            if best_idx >= 0 and best_dist < Yolo26Service._POSE_MATCH_PX:
+            if best_idx >= 0 and best_iou >= Yolo26Service._POSE_IOU_THRESH:
                 keypoints_map[track_id] = pose_kpts_data[best_idx].tolist()
                 used_pose.add(best_idx)
 
@@ -754,13 +789,11 @@ class Yolo26Service:
         if sp.get("theft_detection", False):
             if job.get("pose_theft_mode"):
                 rules.append(
-                    "ADVANCED POSE THEFT MODE: Analyze the kinematic events in the text. "
-                    "Look for the Pre-Crime Sequence: "
-                    "1. Browsing (wrist interacts with item). "
-                    "2. Concealment (wrist moves to hip/pocket/backpack). "
-                    "3. Flight (item disappears, person speeds up or leaves). "
-                    "If you see Concealment followed by the item disappearing, "
-                    "flag as HIGH RISK THEFT immediately."
+                    "ADVANCED POSE THEFT MODE: The system tracks deterministic theft stages "
+                    "(BROWSING -> CONCEALING -> FLIGHT). If the text reports "
+                    "'STATE_CHANGE: Person#X entered FLIGHT stage', this is absolute "
+                    "mathematical proof of theft. Flag as HIGH RISK THEFT immediately. "
+                    "Provide a short explanation of the sequence."
                 )
             else:
                 rules.append(

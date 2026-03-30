@@ -57,6 +57,8 @@ class ObjectState:
     erratic: bool
     close_to: list[str] = field(default_factory=list)  # e.g. ["Person#2", "Handbag#5"]
     keypoints: list | None = field(default=None)
+    theft_stage: str = field(default="NONE")
+    last_kinematic_time: float = field(default=0.0)
 
 
 class AdvancedLogicEngine:
@@ -241,6 +243,8 @@ class AdvancedLogicEngine:
                     "class_id": class_id,
                     "class_name": class_name,
                     "last_close_to": [],
+                    "theft_stage": "NONE",
+                    "last_kinematic_time": 0.0,
                 }
             hist = self._history[track_id]
             dt = max(timestamp - hist["last_seen_time"], 1.0 / self._fps)
@@ -303,6 +307,8 @@ class AdvancedLogicEngine:
                     loiter_seconds=float(hist["zone_durations"].get(zone, 0.0)) if zone else 0.0,
                     erratic=erratic,
                     keypoints=kp,
+                    theft_stage=hist.get("theft_stage", "NONE"),
+                    last_kinematic_time=hist.get("last_kinematic_time", 0.0),
                 )
             )
 
@@ -312,10 +318,12 @@ class AdvancedLogicEngine:
         if self.pose_theft_mode:
             self._detect_pose_theft_heuristics(states)
 
-        # Snapshot close_to back into history for disappearance checks
+        # Snapshot close_to and theft state back into history
         for s in states:
             if s.track_id in self._history:
                 self._history[s.track_id]["last_close_to"] = list(s.close_to)
+                self._history[s.track_id]["theft_stage"] = s.theft_stage
+                self._history[s.track_id]["last_kinematic_time"] = s.last_kinematic_time
 
         # --- Disappearance detection (theft / concealment) ---
         self._detect_disappearances(states, seen_ids, frame_index)
@@ -358,13 +366,16 @@ class AdvancedLogicEngine:
     # -----------------------------------------------------------------
     # Pose-based theft heuristics (only when pose_theft_mode is True)
     # -----------------------------------------------------------------
+    _SHOULDER_INDICES = (5, 6)  # COCO: left_shoulder, right_shoulder
     _WRIST_INDICES = (9, 10)   # COCO: left_wrist, right_wrist
     _HIP_INDICES = (11, 12)    # COCO: left_hip, right_hip
     _KP_MIN_CONF = 0.3
     _WRIST_HIP_PX = 30.0      # base proximity threshold (scaled by perspective)
 
+    _STAGE_TIMEOUT = 5.0  # seconds between BROWSING -> CONCEALING
+
     def _detect_pose_theft_heuristics(self, objects: list[ObjectState]) -> None:
-        """Check wrist-to-item and wrist-to-pocket kinematics for persons."""
+        """Kinematic checks with deterministic state machine transitions."""
         persons = [o for o in objects if o.class_id in self._person_class_ids and o.keypoints]
         if not persons:
             return
@@ -377,6 +388,7 @@ class AdvancedLogicEngine:
         stealable_polys = [(s, box(*s.bbox.tolist())) for s in stealables] if stealables else []
 
         fh = self._frame_height
+        now = self._last_timestamp or 0.0
 
         for person in persons:
             kp = person.keypoints
@@ -394,6 +406,8 @@ class AdvancedLogicEngine:
             if not wrists:
                 continue
 
+            # --- Wrist-to-Item (BROWSING) ---
+            item_touched = False
             for wx, wy in wrists:
                 wrist_pt = Point(wx, wy)
                 for item, item_poly in stealable_polys:
@@ -402,8 +416,19 @@ class AdvancedLogicEngine:
                             f"POSE_KINEMATIC: Person#{person.track_id} wrist "
                             f"interacted with {item.class_name}#{item.track_id}"
                         )
+                        item_touched = True
                         break
+                if item_touched:
+                    break
 
+            if item_touched and person.theft_stage == "NONE":
+                person.theft_stage = "BROWSING"
+                person.last_kinematic_time = now
+                self._event_log.append(
+                    f"STATE_CHANGE: Person#{person.track_id} entered BROWSING stage"
+                )
+
+            # --- Wrist-to-Hip / Wrist-to-Torso (CONCEALING) ---
             hips: list[tuple[float, float]] = []
             for idx in self._HIP_INDICES:
                 pt = kp[idx]
@@ -412,21 +437,53 @@ class AdvancedLogicEngine:
                 elif len(pt) >= 2 and pt[0] > 0 and pt[1] > 0:
                     hips.append((pt[0], pt[1]))
 
+            depth_scale = max(person.bbox[3] / fh, 0.1)
+            concealment_threshold = self._WRIST_HIP_PX * depth_scale
+            concealment_detected = False
+
             if hips:
-                depth_scale = max(person.bbox[3] / fh, 0.1)
-                threshold = self._WRIST_HIP_PX * depth_scale
                 for wx, wy in wrists:
                     for hx, hy in hips:
-                        dist = float(np.hypot(wx - hx, wy - hy))
-                        if dist < threshold:
+                        if float(np.hypot(wx - hx, wy - hy)) < concealment_threshold:
                             self._event_log.append(
                                 f"POSE_KINEMATIC: Person#{person.track_id} "
                                 f"wrist moved to hip/pocket area"
                             )
+                            concealment_detected = True
                             break
-                    else:
-                        continue
-                    break
+                    if concealment_detected:
+                        break
+
+            if not concealment_detected:
+                torso_pts: list[tuple[float, float]] = []
+                for idx in self._SHOULDER_INDICES + self._HIP_INDICES:
+                    pt = kp[idx]
+                    if len(pt) >= 3 and pt[2] >= self._KP_MIN_CONF:
+                        torso_pts.append((pt[0], pt[1]))
+                    elif len(pt) >= 2 and pt[0] > 0 and pt[1] > 0:
+                        torso_pts.append((pt[0], pt[1]))
+                if len(torso_pts) >= 2:
+                    tcx = sum(p[0] for p in torso_pts) / len(torso_pts)
+                    tcy = sum(p[1] for p in torso_pts) / len(torso_pts)
+                    for wx, wy in wrists:
+                        if float(np.hypot(wx - tcx, wy - tcy)) < concealment_threshold:
+                            self._event_log.append(
+                                f"POSE_KINEMATIC: Person#{person.track_id} "
+                                f"wrist moved to inner jacket/torso area"
+                            )
+                            concealment_detected = True
+                            break
+
+            if (
+                concealment_detected
+                and person.theft_stage == "BROWSING"
+                and (now - person.last_kinematic_time) < self._STAGE_TIMEOUT
+            ):
+                person.theft_stage = "CONCEALING"
+                person.last_kinematic_time = now
+                self._event_log.append(
+                    f"STATE_CHANGE: Person#{person.track_id} entered CONCEALING stage"
+                )
 
     # -----------------------------------------------------------------
     # Disappearance / concealment detection
@@ -488,6 +545,20 @@ class AdvancedLogicEngine:
                             f"close to {', '.join(person_neighbors)}. "
                             f"Possible theft/concealment."
                         )
+                        if self.pose_theft_mode:
+                            import re as _re
+                            for nb in person_neighbors:
+                                m = _re.search(r"#(\d+)", nb)
+                                if not m:
+                                    continue
+                                ptid = int(m.group(1))
+                                phist = self._history.get(ptid)
+                                if phist and phist.get("theft_stage") == "CONCEALING":
+                                    phist["theft_stage"] = "FLIGHT"
+                                    self._event_log.append(
+                                        f"STATE_CHANGE: Person#{ptid} entered FLIGHT stage "
+                                        f"— {last_class_name}#{track_id} confirmed stolen"
+                                    )
 
             del self._ghost_states[track_id]
 
