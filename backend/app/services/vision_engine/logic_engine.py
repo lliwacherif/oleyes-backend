@@ -616,7 +616,9 @@ class AdvancedLogicEngine:
     # -----------------------------------------------------------------
     @staticmethod
     def _is_static(obj: ObjectState) -> bool:
-        return obj.speed < 15 and not obj.erratic and not obj.close_to
+        if obj.class_id == 0:
+            return False
+        return obj.speed < 15 and not obj.erratic
 
     def _build_scene_text(
         self, objects: list[ObjectState]

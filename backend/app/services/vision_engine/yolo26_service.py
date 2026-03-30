@@ -1033,21 +1033,16 @@ class Yolo26Service:
         for i, frame in enumerate(frames):
             if not isinstance(frame, dict) or not frame.get("scene_text"):
                 continue
-            raw = frame["scene_text"]
+            scene_text = frame["scene_text"]
+            fidx = frame.get("frame_index", "?")
             if i < last_idx:
-                lines = raw.split("\n")
-                current_only = []
-                in_current = False
-                for line in lines:
-                    if line.startswith("EVENTS:") or line.startswith("  - "):
-                        current_only.append(line)
-                        continue
-                    if line.startswith("CURRENT STATE:"):
-                        in_current = True
-                    if in_current:
-                        current_only.append(line)
-                raw = "\n".join(current_only) if current_only else raw
-            texts.append(f"Frame {frame.get('frame_index')}: {raw}")
+                if "CURRENT STATE:" in scene_text:
+                    parsed_state = scene_text.split("CURRENT STATE:", 1)[1].strip()
+                    texts.append(f"Frame {fidx} CURRENT STATE:\n{parsed_state}")
+                else:
+                    texts.append(f"Frame {fidx} CURRENT STATE:\n{scene_text}")
+            else:
+                texts.append(f"Frame {fidx} FULL SUMMARY:\n{scene_text}")
         if texts:
             buffer.append("\n".join(texts))
 
