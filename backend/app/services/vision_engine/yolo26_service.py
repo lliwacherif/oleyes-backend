@@ -785,27 +785,45 @@ class Yolo26Service:
             '"label": "2-5 word title", "explanation": "1 short sentence concluding the risk"}\n\n'
         )
 
+        if job.get("pose_theft_mode"):
+            base += (
+                "RULES:\n"
+                "  1) ADVANCED POSE THEFT MODE: The system tracks deterministic theft stages "
+                "(BROWSING -> CONCEALING -> FLIGHT). If the text reports "
+                "'STATE_CHANGE: Person#X entered FLIGHT stage', this is absolute "
+                "mathematical proof of theft. Flag as HIGH RISK THEFT immediately. "
+                "Provide a short explanation of the sequence.\n"
+                "  2) You are in THEFT-ONLY mode. Ignore violence, falls, fire, "
+                "and all other non-theft events. If no theft stages are reported, "
+                "respond with LOW risk and a neutral label.\n\n"
+                "IMPORTANT: ONLY analyze POSE_KINEMATIC and STATE_CHANGE events. "
+                "Normal person movement is LOW risk. Only FLIGHT stage = HIGH risk."
+            )
+            zone_instructions = job.get("zone_instructions")
+            if zone_instructions and isinstance(zone_instructions, dict):
+                zone_rules = [
+                    f"- Zone \"{n}\": {instr}"
+                    for n, instr in zone_instructions.items() if instr
+                ]
+                if zone_rules:
+                    base += (
+                        "\n\nROI ZONE RULES:\n"
+                        + "\n".join(zone_rules)
+                    )
+            return base
+
         rules = []
         if sp.get("theft_detection", False):
-            if job.get("pose_theft_mode"):
-                rules.append(
-                    "ADVANCED POSE THEFT MODE: The system tracks deterministic theft stages "
-                    "(BROWSING -> CONCEALING -> FLIGHT). If the text reports "
-                    "'STATE_CHANGE: Person#X entered FLIGHT stage', this is absolute "
-                    "mathematical proof of theft. Flag as HIGH RISK THEFT immediately. "
-                    "Provide a short explanation of the sequence."
-                )
-            else:
-                rules.append(
-                    "THEFT: If a Person overlaps an Item and the Item disappears "
-                    "while the Person moves away, that is HIGH risk theft. "
-                    "CRITICAL TEMPORAL ANALYSIS: You are receiving two recent frame batches. "
-                    "Compare them. If a stealable object (bag, phone, laptop, etc.) appears "
-                    "in the older frame but is missing in the newest frame, check the TIMELINE "
-                    "to see if a Person was 'Nearby' or 'close_to' it right before it vanished. "
-                    "If yes, and the person is now moving quickly or erratically, this is a "
-                    "HIGH risk theft."
-                )
+            rules.append(
+                "THEFT: If a Person overlaps an Item and the Item disappears "
+                "while the Person moves away, that is HIGH risk theft. "
+                "CRITICAL TEMPORAL ANALYSIS: You are receiving two recent frame batches. "
+                "Compare them. If a stealable object (bag, phone, laptop, etc.) appears "
+                "in the older frame but is missing in the newest frame, check the TIMELINE "
+                "to see if a Person was 'Nearby' or 'close_to' it right before it vanished. "
+                "If yes, and the person is now moving quickly or erratically, this is a "
+                "HIGH risk theft."
+            )
         else:
             rules.append(
                 "THEFT: Theft detection is DISABLED. Do NOT flag theft, "
