@@ -445,12 +445,14 @@ class Yolo26Service:
             "timestamp": time(),
             "vectors": detections,
         }
+        orig_shape = getattr(result, "orig_shape", (720, 1280))
         self._logic.update(
             {
                 "frame_index": frame_index,
                 "timestamp": time(),
                 "vectors": detections,
-                "frame_height": float(getattr(result, "orig_shape", (720, 1280))[0]),
+                "frame_height": float(orig_shape[0]),
+                "frame_width": float(orig_shape[1]),
                 "keypoints_map": keypoints_map,
             }
         )

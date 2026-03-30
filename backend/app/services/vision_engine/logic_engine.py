@@ -87,6 +87,7 @@ class AdvancedLogicEngine:
 
         # Perspective scaling (updated each frame from YOLO result)
         self._frame_height: float = 720.0
+        self._frame_width: float = 1280.0
 
         # Ghost state: tracks that disappeared but may reappear (anti-jitter)
         # track_id -> {"hist": <history dict>, "ttl": int, "entered_frame": int}
@@ -142,8 +143,11 @@ class AdvancedLogicEngine:
         self._zones = {name: Polygon(points) for name, points in zones.items()}
 
     def update(self, yolo_results: dict[str, Any] | list[Any]) -> None:
-        if isinstance(yolo_results, dict) and "frame_height" in yolo_results:
-            self._frame_height = float(yolo_results["frame_height"])
+        if isinstance(yolo_results, dict):
+            if "frame_height" in yolo_results:
+                self._frame_height = float(yolo_results["frame_height"])
+            if "frame_width" in yolo_results:
+                self._frame_width = float(yolo_results["frame_width"])
 
         detections = self._normalize_detections(yolo_results)
         if not detections:
@@ -566,11 +570,12 @@ class AdvancedLogicEngine:
     # Timeline — sliding window of significant snapshots
     # -----------------------------------------------------------------
     def _record_timeline(self, states: list[ObjectState], timestamp: float) -> None:
-        """Capture a short summary of the current frame for the sliding window."""
+        """Capture a short summary of active objects for the sliding window."""
         entries: list[str] = []
         for obj in states:
+            if self._is_static(obj):
+                continue
             parts_obj: list[str] = []
-            # Only record noteworthy info
             if obj.speed >= self._running_speed:
                 parts_obj.append(f"FAST ({obj.speed:.0f}px/s)")
             elif obj.speed < 5:
@@ -581,25 +586,50 @@ class AdvancedLogicEngine:
                 parts_obj.append("Erratic")
             if obj.close_to:
                 parts_obj.append(f"near [{', '.join(obj.close_to)}]")
-            entries.append(f"{obj.class_name}#{obj.track_id}: {', '.join(parts_obj)}")
+            cx = float(obj.center[0]) if obj.center is not None else 0.0
+            cy = float(obj.center[1]) if obj.center is not None else 0.0
+            grid = self._get_grid_position(cx, cy)
+            entries.append(f"{obj.class_name}#{obj.track_id}: {', '.join(parts_obj)} [Grid: {grid}]")
 
         self._timeline.append({
             "timestamp": timestamp,
-            "summary": "; ".join(entries) if entries else "No objects",
+            "summary": "; ".join(entries) if entries else "No active objects",
         })
+
+    # -----------------------------------------------------------------
+    # Spatial grid helper
+    # -----------------------------------------------------------------
+    _GRID_COLS = ("Left", "Center", "Right")
+    _GRID_ROWS = ("Top", "Center", "Bottom")
+
+    def _get_grid_position(self, cx: float, cy: float) -> str:
+        col_idx = min(int(cx / (self._frame_width / 3.0)), 2)
+        row_idx = min(int(cy / (self._frame_height / 3.0)), 2)
+        row = self._GRID_ROWS[row_idx]
+        col = self._GRID_COLS[col_idx]
+        if row == "Center" and col == "Center":
+            return "Center"
+        return f"{row}-{col}"
 
     # -----------------------------------------------------------------
     # Build final scene text for the LLM
     # -----------------------------------------------------------------
+    @staticmethod
+    def _is_static(obj: ObjectState) -> bool:
+        return obj.speed < 5 and not obj.erratic and not obj.close_to
+
     def _build_scene_text(
         self, objects: list[ObjectState]
     ) -> str:
         if not objects:
             return "Scene empty."
 
+        static = [o for o in objects if self._is_static(o)]
+        active = [o for o in objects if not self._is_static(o)]
+
         parts: list[str] = []
 
-        # --- Section 1: Events (disappearances, zone intrusions) ---
+        # --- Events (disappearances, zone intrusions, kinematics) ---
         if self._event_log:
             parts.append("EVENTS:")
             for evt in self._event_log:
@@ -607,38 +637,50 @@ class AdvancedLogicEngine:
             parts.append("")
             self._event_log.clear()
 
-        # --- Section 2: Timeline (sliding window of recent states) ---
+        # --- Static inventory (single compressed line) ---
+        if static:
+            names = ", ".join(f"{o.class_name}#{o.track_id}" for o in static)
+            parts.append(f"STATIC INVENTORY: {names} (All Stationary)")
+            parts.append("")
+
+        # --- Timeline (active objects only) ---
         if len(self._timeline) > 1:
-            parts.append("TIMELINE (recent history):")
+            parts.append("TIMELINE:")
             now = self._timeline[-1]["timestamp"]
-            # Show all except the very last (that's the "current" state)
             for entry in list(self._timeline)[:-1]:
                 age = now - entry["timestamp"]
                 parts.append(f"  T-{age:.1f}s: {entry['summary']}")
             parts.append("")
 
-        # --- Section 3: Current object states ---
-        parts.append("CURRENT STATE:")
-        for obj in objects:
-            cname = obj.class_name
-            # Speed label
-            if obj.speed < 5:
-                motion = "Stationary"
-            elif obj.speed < self._running_speed:
-                motion = f"Moving ({obj.speed:.0f}px/s)"
-            else:
-                motion = f"FAST/Running ({obj.speed:.0f}px/s)"
+        # --- Current state (active objects only, with grid) ---
+        if active:
+            parts.append("CURRENT STATE:")
+            for obj in active:
+                cname = obj.class_name
+                if obj.speed < 5:
+                    motion = "Stationary"
+                elif obj.speed < self._running_speed:
+                    motion = f"Moving ({obj.speed:.0f}px/s)"
+                else:
+                    motion = f"FAST/Running ({obj.speed:.0f}px/s)"
 
-            erratic_tag = ", Erratic" if obj.erratic else ""
-            zone_tag = f", Zone: {obj.zone}" if obj.zone else ""
-            loiter_tag = f", Loitering: {obj.loiter_seconds:.0f}s" if obj.loiter_seconds > 2 else ""
-            nearby = f", Nearby: [{', '.join(obj.close_to)}]" if obj.close_to else ""
-            weapon_tag = " [WEAPON]" if self._is_weapon(obj) else ""
+                cx = float(obj.center[0]) if obj.center is not None else 0.0
+                cy = float(obj.center[1]) if obj.center is not None else 0.0
+                grid = self._get_grid_position(cx, cy)
 
-            parts.append(
-                f"  {cname}#{obj.track_id}: {motion}{erratic_tag}"
-                f"{zone_tag}{loiter_tag}{nearby}{weapon_tag}"
-            )
+                erratic_tag = ", Erratic" if obj.erratic else ""
+                zone_tag = f", Zone: {obj.zone}" if obj.zone else ""
+                loiter_tag = f", Loitering: {obj.loiter_seconds:.0f}s" if obj.loiter_seconds > 2 else ""
+                nearby = f" -> NEARBY: [{', '.join(obj.close_to)}]" if obj.close_to else ""
+                weapon_tag = " [WEAPON]" if self._is_weapon(obj) else ""
+
+                parts.append(
+                    f"  {cname}#{obj.track_id}: {motion}{erratic_tag}"
+                    f" [Grid: {grid}]{zone_tag}{loiter_tag}{weapon_tag}{nearby}"
+                )
+
+        if not static and not active:
+            parts.append("Scene empty.")
 
         return "\n".join(parts)
 
