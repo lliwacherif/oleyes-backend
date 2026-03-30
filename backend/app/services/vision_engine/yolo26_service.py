@@ -1029,22 +1029,28 @@ class Yolo26Service:
             buffer = []
             job["analysis_buffer"] = buffer
         texts = []
-        last_idx = len(frames) - 1
         for i, frame in enumerate(frames):
-            if not isinstance(frame, dict) or not frame.get("scene_text"):
+            if not isinstance(frame, dict):
                 continue
-            scene_text = frame["scene_text"]
-            fidx = frame.get("frame_index", "?")
-            if i < last_idx:
+            scene_text = frame.get("scene_text")
+            if not scene_text:
+                continue
+
+            frame_idx = frame.get("frame_index", "?")
+
+            if i < len(frames) - 1:
                 if "CURRENT STATE:" in scene_text:
-                    parsed_state = scene_text.split("CURRENT STATE:", 1)[1].strip()
-                    texts.append(f"Frame {fidx} CURRENT STATE:\n{parsed_state}")
+                    parts = scene_text.split("CURRENT STATE:")
+                    if len(parts) > 1:
+                        parsed_state = parts[1].strip()
+                        texts.append(f"Frame {frame_idx} CURRENT STATE:\n{parsed_state}")
                 else:
-                    texts.append(f"Frame {fidx} CURRENT STATE:\n{scene_text}")
+                    texts.append(f"Frame {frame_idx} CURRENT STATE:\n{scene_text.strip()}")
             else:
-                texts.append(f"Frame {fidx} FULL SUMMARY:\n{scene_text}")
+                texts.append(f"Frame {frame_idx} FULL SUMMARY:\n{scene_text.strip()}")
+
         if texts:
-            buffer.append("\n".join(texts))
+            buffer.append("\n\n".join(texts))
 
         if self._scene_is_calm(job):
             job["analysis"] = {
