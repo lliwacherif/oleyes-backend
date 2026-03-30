@@ -4,8 +4,8 @@ import json
 import logging
 import os
 from collections import deque
-from threading import Lock
-from threading import Event
+import queue
+from threading import Event, Lock, Thread
 from time import time
 
 import cv2
@@ -37,12 +37,17 @@ class Yolo26Service:
         self._jobs: dict[str, dict[str, object]] = {}
         self._model: YOLO | None = None
         self._model_lock = Lock()
+        self._pose_model: YOLO | None = None
+        self._pose_model_lock = Lock()
         self._logic = AdvancedLogicEngine(zones={})
         self._analysis_client = httpx.Client(
             base_url=config.SCALWAY_BASE_URL,
             headers={"Authorization": f"Bearer {config.SCALWAY_API_KEY}"},
             timeout=config.SCALWAY_TIMEOUT,
         )
+        self._analysis_queue: queue.Queue = queue.Queue(maxsize=4)
+        self._analysis_worker: Thread | None = None
+        self._worker_lock = Lock()
 
     def _get_model(self) -> YOLO:
         if self._model is not None:
@@ -51,6 +56,15 @@ class Yolo26Service:
             if self._model is None:
                 self._model = YOLO(config.YOLO_MODEL)
         return self._model
+
+    def _get_pose_model(self) -> YOLO:
+        if self._pose_model is not None:
+            return self._pose_model
+        with self._pose_model_lock:
+            if self._pose_model is None:
+                self._pose_model = YOLO(config.YOLO_POSE_MODEL)
+                logger.info("pose_model_loaded model=%s", config.YOLO_POSE_MODEL)
+        return self._pose_model
 
     def stop_all_running(self) -> int:
         """Signal every running/queued job to stop. Returns how many were stopped."""
@@ -64,6 +78,7 @@ class Yolo26Service:
                 job["finished_at"] = time()
                 count += 1
                 logger.info("auto_stopped job=%s (new job incoming)", jid)
+        self._shutdown_analysis_worker()
         return count
 
     def _reset_tracker(self) -> None:
@@ -91,6 +106,7 @@ class Yolo26Service:
         zones: dict[str, list[list[float]]] | None = None,
         zone_instructions: dict[str, str] | None = None,
         security_priorities: dict[str, bool] | None = None,
+        pose_theft_mode: bool = False,
     ) -> None:
         self.stop_all_running()
         self._reset_tracker()
@@ -105,15 +121,18 @@ class Yolo26Service:
         sp = security_priorities or {}
         theft_on = sp.get("theft_detection", True)
         self._logic.theft_detection_enabled = theft_on
-        logger.info("security_priorities theft=%s fire=%s fall=%s violence=%s analytics=%s",
+        self._logic.pose_theft_mode = pose_theft_mode
+        logger.info("security_priorities theft=%s fire=%s fall=%s violence=%s analytics=%s pose_theft=%s",
                      theft_on, sp.get("fire_detection"), sp.get("person_fall_detection"),
-                     sp.get("violence_detection"), sp.get("customer_behavior_analytics"))
+                     sp.get("violence_detection"), sp.get("customer_behavior_analytics"),
+                     pose_theft_mode)
 
         self._jobs[job_id] = {
             "status": "queued",
             "source_url": source_url,
             "scene_context": scene_context,
             "stream_protocol": stream_protocol,
+            "pose_theft_mode": pose_theft_mode,
             "zones": zones or {},
             "zone_instructions": zone_instructions or {},
             "security_priorities": sp,
@@ -134,6 +153,7 @@ class Yolo26Service:
             "risk_scores": deque(maxlen=5),
             "stop_event": Event(),
         }
+        self._ensure_analysis_worker()
         if scene_context:
             logger.info("Job queued id=%s proto=%s scene_context=\"%s\"", job_id, stream_protocol, scene_context)
         else:
@@ -183,6 +203,8 @@ class Yolo26Service:
             logger.info("yolo_source_resolved id=%s", job_id)
             self._reset_tracker()
             model = self._get_model()
+            pose_mode = bool(job.get("pose_theft_mode"))
+            pose_model = self._get_pose_model() if pose_mode else None
             results = model.track(
                 source=resolved_source,
                 stream=True,
@@ -191,6 +213,7 @@ class Yolo26Service:
                 verbose=False,
                 max_det=config.YOLO_MAX_DETECTIONS,
                 persist=True,
+                tracker="bytetrack.yaml",
                 vid_stride=config.YOLO_VID_STRIDE,
                 stream_buffer=config.YOLO_STREAM_BUFFER,
             )
@@ -199,7 +222,17 @@ class Yolo26Service:
                     job["status"] = "stopped"
                     job["finished_at"] = time()
                     break
-                self._process_result(job_id, job, result)
+                pose_result = None
+                if pose_mode and pose_model is not None:
+                    frame_img = getattr(result, "orig_img", None)
+                    if frame_img is not None:
+                        pose_results = pose_model.predict(
+                            frame_img, conf=0.5,
+                            device=config.YOLO_DEVICE, verbose=False,
+                        )
+                        if pose_results:
+                            pose_result = pose_results[0]
+                self._process_result(job_id, job, result, pose_result)
             self._finalize_job(job_id, job)
         except Exception as exc:
             job["status"] = "error"
@@ -264,9 +297,18 @@ class Yolo26Service:
                     verbose=False,
                     max_det=config.YOLO_MAX_DETECTIONS,
                     persist=True,
+                    tracker="bytetrack.yaml",
                 )
                 if results:
-                    self._process_result(job_id, job, results[0])
+                    pose_result = None
+                    if job.get("pose_theft_mode"):
+                        pose_results = self._get_pose_model().predict(
+                            frame, conf=0.5,
+                            device=config.YOLO_DEVICE, verbose=False,
+                        )
+                        if pose_results:
+                            pose_result = pose_results[0]
+                    self._process_result(job_id, job, results[0], pose_result)
 
             self._finalize_job(job_id, job)
         except Exception as exc:
@@ -282,8 +324,69 @@ class Yolo26Service:
     # Shared helpers for frame processing
     # ------------------------------------------------------------------
 
-    def _process_result(self, job_id: str, job: dict, result) -> None:
-        """Extract detections from a single YOLO result and update job state."""
+    _POSE_MATCH_PX = 50.0
+
+    @staticmethod
+    def _merge_pose_keypoints(std_boxes, pose_result) -> dict[int, list]:
+        """Map keypoints from a separate pose prediction to the tracked
+        person boxes from the standard model using nearest-center matching."""
+        import numpy as _np
+
+        if std_boxes is None or std_boxes.xyxy is None:
+            return {}
+
+        pose_boxes = getattr(pose_result, "boxes", None)
+        pose_kpts = getattr(pose_result, "keypoints", None)
+        if pose_boxes is None or pose_kpts is None or pose_kpts.data is None:
+            return {}
+
+        pose_centers = []
+        pose_kpts_data = pose_kpts.data
+        for i, pb in enumerate(pose_boxes):
+            if i >= len(pose_kpts_data):
+                break
+            pxyxy = pb.xyxy.tolist()[0]
+            pcx = (pxyxy[0] + pxyxy[2]) / 2.0
+            pcy = (pxyxy[1] + pxyxy[3]) / 2.0
+            pose_centers.append((pcx, pcy, i))
+
+        if not pose_centers:
+            return {}
+
+        keypoints_map: dict[int, list] = {}
+        used_pose: set[int] = set()
+
+        for sb in std_boxes:
+            cls_id = int(sb.cls.item()) if sb.cls is not None else -1
+            if cls_id != 0:
+                continue
+            track_id = int(sb.id.item()) if getattr(sb, "id", None) is not None else -1
+            if track_id == -1:
+                continue
+            sxyxy = sb.xyxy.tolist()[0]
+            scx = (sxyxy[0] + sxyxy[2]) / 2.0
+            scy = (sxyxy[1] + sxyxy[3]) / 2.0
+
+            best_dist = float("inf")
+            best_idx = -1
+            for pcx, pcy, pidx in pose_centers:
+                if pidx in used_pose:
+                    continue
+                d = _np.hypot(scx - pcx, scy - pcy)
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = pidx
+
+            if best_idx >= 0 and best_dist < Yolo26Service._POSE_MATCH_PX:
+                keypoints_map[track_id] = pose_kpts_data[best_idx].tolist()
+                used_pose.add(best_idx)
+
+        return keypoints_map
+
+    def _process_result(self, job_id: str, job: dict, result, pose_result=None) -> None:
+        """Extract detections from the standard YOLO result and, when in
+        pose_theft_mode, merge skeleton keypoints from a separate pose
+        prediction by nearest-center matching."""
         job["frames"] = int(job.get("frames", 0)) + 1
         frame_index = int(job["frames"])
 
@@ -298,6 +401,10 @@ class Yolo26Service:
                 detections.append([cls_id, conf, *xyxy, track_id])
             job["detections"] = int(job.get("detections", 0)) + len(detections)
 
+        keypoints_map: dict[int, list] = {}
+        if pose_result is not None:
+            keypoints_map = self._merge_pose_keypoints(boxes, pose_result)
+
         event = {
             "frame_index": frame_index,
             "timestamp": time(),
@@ -308,6 +415,8 @@ class Yolo26Service:
                 "frame_index": frame_index,
                 "timestamp": time(),
                 "vectors": detections,
+                "frame_height": float(getattr(result, "orig_shape", (720, 1280))[0]),
+                "keypoints_map": keypoints_map,
             }
         )
         logic_summary = self._logic.generate_scene_summary()
@@ -430,23 +539,62 @@ class Yolo26Service:
         return bool(isinstance(stop_event, Event) and stop_event.is_set())
 
     _CALM_SPEED = 10.0  # px/s
+    _SENTINEL = object()
 
     @staticmethod
     def _extract_json(text: str) -> dict | None:
         """Pull a JSON object out of LLM output that may be wrapped in
-        markdown, thinking tags, or surrounding prose."""
+        markdown, thinking tags, or surrounding prose.
+
+        Discards the ``chain_of_thought`` key (used only to force the LLM
+        to reason before scoring) so the client payload stays unchanged.
+        """
         import re
+
+        def _clean(obj: dict) -> dict:
+            obj.pop("chain_of_thought", None)
+            return obj
+
         try:
             obj = json.loads(text)
             if isinstance(obj, dict):
-                return obj
+                return _clean(obj)
         except (json.JSONDecodeError, TypeError):
             pass
+
+        fence = re.search(r"```(?:json)?\s*(\{.+?\})\s*```", text, re.DOTALL)
+        if fence:
+            try:
+                obj = json.loads(fence.group(1))
+                if isinstance(obj, dict):
+                    return _clean(obj)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        depth = 0
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and start != -1:
+                    candidate = text[start : i + 1]
+                    try:
+                        obj = json.loads(candidate)
+                        if isinstance(obj, dict) and ("risk" in str(obj) or obj.get("label")):
+                            return _clean(obj)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    start = -1
+
         for m in reversed(list(re.finditer(r'\{[^{}]*\}', text))):
             try:
                 obj = json.loads(m.group())
                 if isinstance(obj, dict) and ("risk" in str(obj) or obj.get("label")):
-                    return obj
+                    return _clean(obj)
             except (json.JSONDecodeError, TypeError):
                 continue
         return None
@@ -469,6 +617,22 @@ class Yolo26Service:
             if obj.get("erratic", False):
                 return False
         return True
+
+    _METADATA_PATTERNS = [
+        r"(?im)^.*\bbusiness[_ ]?name\b.*$",
+        r"(?im)^.*\bnumber[_ ]?of[_ ]?locations?\b.*$",
+        r"(?im)^.*\bbusiness[_ ]?size\b.*$",
+        r"(?im)^.*\bcamera[_ ]?type\b.*$",
+        r"(?im)^.*\bestimated[_ ]?cameras?\b.*$",
+    ]
+
+    @classmethod
+    def _sanitize_scene_context(cls, text: str) -> str:
+        """Strip corporate metadata lines from a scene_context string."""
+        import re
+        for pattern in cls._METADATA_PATTERNS:
+            text = re.sub(pattern, "", text)
+        return "\n".join(line for line in text.splitlines() if line.strip())
 
     _OBJECT_KEYWORDS: dict[str, list[str]] = {
         "person": ["person", "people", "someone", "anybody", "human", "man", "woman", "child", "enter", "entered"],
@@ -579,17 +743,36 @@ class Yolo26Service:
         sp = job.get("security_priorities") or {}
 
         base = (
-            "You are an AI CCTV analyst. Analyze the scene data and respond ONLY with valid JSON:\n"
-            '{"risk_score": 0-100, "risk_level": "LOW"|"MEDIUM"|"HIGH", '
-            '"label": "2-5 word title", "explanation": "1 sentence max 20 words"}\n\n'
+            "You are an AI CCTV analyst. Analyze the scene data and respond ONLY with valid JSON.\n"
+            "You MUST think step-by-step INSIDE the JSON before scoring. Use this exact schema:\n"
+            '{"chain_of_thought": "Briefly summarize object movements and disappearances between the frames", '
+            '"risk_score": 0-100, "risk_level": "LOW"|"MEDIUM"|"HIGH", '
+            '"label": "2-5 word title", "explanation": "1 short sentence concluding the risk"}\n\n'
         )
 
         rules = []
         if sp.get("theft_detection", False):
-            rules.append(
-                "THEFT: If a Person overlaps an Item and the Item disappears "
-                "while the Person moves away, that is HIGH risk theft."
-            )
+            if job.get("pose_theft_mode"):
+                rules.append(
+                    "ADVANCED POSE THEFT MODE: Analyze the kinematic events in the text. "
+                    "Look for the Pre-Crime Sequence: "
+                    "1. Browsing (wrist interacts with item). "
+                    "2. Concealment (wrist moves to hip/pocket/backpack). "
+                    "3. Flight (item disappears, person speeds up or leaves). "
+                    "If you see Concealment followed by the item disappearing, "
+                    "flag as HIGH RISK THEFT immediately."
+                )
+            else:
+                rules.append(
+                    "THEFT: If a Person overlaps an Item and the Item disappears "
+                    "while the Person moves away, that is HIGH risk theft. "
+                    "CRITICAL TEMPORAL ANALYSIS: You are receiving two recent frame batches. "
+                    "Compare them. If a stealable object (bag, phone, laptop, etc.) appears "
+                    "in the older frame but is missing in the newest frame, check the TIMELINE "
+                    "to see if a Person was 'Nearby' or 'close_to' it right before it vanished. "
+                    "If yes, and the person is now moving quickly or erratically, this is a "
+                    "HIGH risk theft."
+                )
         else:
             rules.append(
                 "THEFT: Theft detection is DISABLED. Do NOT flag theft, "
@@ -642,7 +825,9 @@ class Yolo26Service:
 
         scene_context = job.get("scene_context")
         if scene_context:
-            base += f"\n\nSCENE CONTEXT:\n{scene_context}"
+            clean = self._sanitize_scene_context(str(scene_context))
+            if clean:
+                base += f"\n\nSCENE CONTEXT:\n{clean}"
 
         zone_instructions = job.get("zone_instructions")
         if zone_instructions and isinstance(zone_instructions, dict):
@@ -658,7 +843,128 @@ class Yolo26Service:
 
         return base
 
+    # ------------------------------------------------------------------
+    # LLM analysis producer-consumer
+    # ------------------------------------------------------------------
+
+    def _ensure_analysis_worker(self) -> None:
+        """Start the LLM consumer thread if it is not already running."""
+        with self._worker_lock:
+            if self._analysis_worker is None or not self._analysis_worker.is_alive():
+                self._analysis_worker = Thread(
+                    target=self._analysis_consumer,
+                    daemon=True,
+                    name="llm-consumer",
+                )
+                self._analysis_worker.start()
+                logger.info("analysis_worker_started")
+
+    def _shutdown_analysis_worker(self) -> None:
+        """Drain the queue and join the consumer thread."""
+        while not self._analysis_queue.empty():
+            try:
+                self._analysis_queue.get_nowait()
+            except queue.Empty:
+                break
+        with self._worker_lock:
+            if self._analysis_worker is not None and self._analysis_worker.is_alive():
+                self._analysis_queue.put(self._SENTINEL)
+                self._analysis_worker.join(timeout=config.SCALWAY_TIMEOUT + 2)
+                logger.info("analysis_worker_joined")
+            self._analysis_worker = None
+
+    def _analysis_consumer(self) -> None:
+        """Background thread: pull analysis tasks from the queue and call Scaleway."""
+        while True:
+            item = self._analysis_queue.get()
+            if item is self._SENTINEL:
+                break
+            job, combined, system_prompt = item
+            try:
+                self._run_llm_analysis(job, combined, system_prompt)
+            except Exception as exc:
+                logger.warning("analysis_consumer unhandled: %s", exc)
+
+    def _run_llm_analysis(self, job: dict, combined: str, system_prompt: str) -> None:
+        """Execute the synchronous Scaleway LLM call (runs in consumer thread)."""
+        fallback = {
+            "risk_score": 30, "risk_score_raw": 30,
+            "risk_level": "MEDIUM", "label": "Activity detected",
+            "explanation": "Movement or event detected, AI assessment pending.",
+            "text": "",
+        }
+        try:
+            payload = {
+                "model": config.SCALWAY_ANALYSIS_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": combined},
+                ],
+                "max_tokens": config.SCALWAY_ANALYSIS_MAX_TOKENS,
+                "temperature": config.SCALWAY_ANALYSIS_TEMPERATURE,
+                "top_p": config.SCALWAY_ANALYSIS_TOP_P,
+                "presence_penalty": config.SCALWAY_ANALYSIS_PRESENCE_PENALTY,
+                "stream": False,
+            }
+            response = self._analysis_client.post("/chat/completions", json=payload)
+            response.raise_for_status()
+            data = response.json()
+            raw_content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content")
+            ) or ""
+
+            if not raw_content:
+                logger.warning("LLM empty content — using fallback")
+                job["analysis"] = fallback
+                return
+
+            analysis = self._extract_json(raw_content)
+            if not analysis or not analysis.get("label"):
+                logger.warning("LLM no JSON found — raw: %s", raw_content[:200])
+                job["analysis"] = fallback
+                return
+
+            raw_score = int(analysis.get("risk_score", 0))
+            risk_scores = job.get("risk_scores")
+            if not isinstance(risk_scores, deque):
+                risk_scores = deque(maxlen=5)
+                job["risk_scores"] = risk_scores
+            risk_scores.append(raw_score)
+
+            smoothed_score = int(sum(risk_scores) / len(risk_scores))
+            consecutive_high = sum(1 for s in risk_scores if s >= 70)
+            if consecutive_high >= 3:
+                smoothed_level = "HIGH"
+            elif smoothed_score >= 50:
+                smoothed_level = "MEDIUM"
+            else:
+                smoothed_level = "LOW"
+
+            analysis["risk_score_raw"] = raw_score
+            analysis["risk_score"] = smoothed_score
+            analysis["risk_level"] = smoothed_level
+            analysis["text"] = raw_content
+
+            job["analysis"] = analysis
+            logger.info(
+                "🤖 Analysis: %s | risk=%d (raw=%d) %s",
+                analysis.get("label", "?"),
+                smoothed_score,
+                raw_score,
+                smoothed_level,
+            )
+        except Exception as exc:
+            logger.warning("❌ Analysis failed: %s", exc)
+            job["analysis"] = fallback
+
+    # ------------------------------------------------------------------
+    # Producer: prepare + enqueue (called from detection loop)
+    # ------------------------------------------------------------------
+
     def _maybe_analyze(self, job: dict[str, object]) -> None:
+        """Prepare analysis payload and enqueue for the background LLM consumer."""
         batch = job.get("last_event", {})
         if not isinstance(batch, dict):
             return
@@ -678,9 +984,7 @@ class Yolo26Service:
         if texts:
             buffer.append("\n".join(texts))
 
-        calm = self._scene_is_calm(job)
-
-        if calm:
+        if self._scene_is_calm(job):
             job["analysis"] = {
                 "risk_score": 0, "risk_score_raw": 0,
                 "risk_level": "LOW", "label": "Normal activity",
@@ -694,84 +998,16 @@ class Yolo26Service:
 
         combined = "\n\n".join(buffer[-2:])
         system_prompt = self._build_dynamic_prompt(job)
-
-        payload = {
-            "model": config.SCALWAY_ANALYSIS_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": combined},
-            ],
-            "max_tokens": config.SCALWAY_ANALYSIS_MAX_TOKENS,
-            "temperature": config.SCALWAY_ANALYSIS_TEMPERATURE,
-            "top_p": config.SCALWAY_ANALYSIS_TOP_P,
-            "presence_penalty": config.SCALWAY_ANALYSIS_PRESENCE_PENALTY,
-            "stream": False,
-        }
-
-        fallback = {
-            "risk_score": 30, "risk_score_raw": 30,
-            "risk_level": "MEDIUM", "label": "Activity detected",
-            "explanation": "Movement or event detected, AI assessment pending.",
-            "text": "",
-        }
+        buffer.clear()
 
         try:
-            response = self._analysis_client.post("/chat/completions", json=payload)
-            response.raise_for_status()
-            data = response.json()
-            raw_content = (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content")
-            ) or ""
-
-            if not raw_content:
-                logger.warning("LLM empty content — using fallback")
-                job["analysis"] = fallback
-                buffer.clear()
-                return
-
-            analysis = self._extract_json(raw_content)
-            if not analysis or not analysis.get("label"):
-                logger.warning("LLM no JSON found — raw: %s", raw_content[:200])
-                job["analysis"] = fallback
-                buffer.clear()
-                return
-
-            # --- Risk score smoothing ---
-            raw_score = int(analysis.get("risk_score", 0))
-            risk_scores = job.get("risk_scores")
-            if not isinstance(risk_scores, deque):
-                risk_scores = deque(maxlen=5)
-                job["risk_scores"] = risk_scores
-            risk_scores.append(raw_score)
-
-            smoothed_score = int(sum(risk_scores) / len(risk_scores))
-
-            consecutive_high = sum(1 for s in risk_scores if s >= 70)
-            if consecutive_high >= 3:
-                smoothed_level = "HIGH"
-            elif smoothed_score >= 50:
-                smoothed_level = "MEDIUM"
-            else:
-                smoothed_level = "LOW"
-
-            analysis["risk_score_raw"] = raw_score
-            analysis["risk_score"] = smoothed_score
-            analysis["risk_level"] = smoothed_level
-            analysis["text"] = raw_content
-
-            job["analysis"] = analysis
-            buffer.clear()
-
-            logger.info(
-                "🤖 Analysis: %s | risk=%d (raw=%d) %s",
-                analysis.get("label", "?"),
-                smoothed_score,
-                raw_score,
-                smoothed_level,
-            )
-        except Exception as exc:  # pragma: no cover
-            logger.warning("❌ Analysis failed: %s", exc)
-            job["analysis"] = fallback
-            buffer.clear()
+            self._analysis_queue.put_nowait((job, combined, system_prompt))
+        except queue.Full:
+            try:
+                self._analysis_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._analysis_queue.put_nowait((job, combined, system_prompt))
+            except queue.Full:
+                pass

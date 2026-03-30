@@ -84,6 +84,10 @@ class VisionYoutubeRequest(BaseModel):
         default=None,
         description="Optional scene description to ground the AI analysis (e.g. 'Supermarket, busy hour')",
     )
+    pose_theft_mode: bool = Field(
+        default=False,
+        description="Use YOLO-Pose keypoint tracking for concealment kinematic analysis",
+    )
 
 
 class VisionRtspRequest(BaseModel):
@@ -92,6 +96,10 @@ class VisionRtspRequest(BaseModel):
     scene_context: str | None = Field(
         default=None,
         description="Optional scene description to ground the AI analysis",
+    )
+    pose_theft_mode: bool = Field(
+        default=False,
+        description="Use YOLO-Pose keypoint tracking for concealment kinematic analysis",
     )
 
 
@@ -104,6 +112,10 @@ class VisionRtmpRequest(BaseModel):
     scene_context: str | None = Field(
         default=None,
         description="Optional scene description to ground the AI analysis",
+    )
+    pose_theft_mode: bool = Field(
+        default=False,
+        description="Use YOLO-Pose keypoint tracking for concealment kinematic analysis",
     )
 
 
@@ -128,6 +140,7 @@ async def start_youtube_detection(
         job_id=job_id,
         source_url=str(request.youtube_url),
         scene_context=scene_context,
+        pose_theft_mode=request.pose_theft_mode,
     )
     background_tasks.add_task(
         _service.start_job, job_id=job_id, source_url=str(request.youtube_url)
@@ -165,6 +178,7 @@ async def start_rtsp_detection(
         zones=zones or None,
         zone_instructions=zone_instructions or None,
         security_priorities=priorities or None,
+        pose_theft_mode=request.pose_theft_mode,
     )
     background_tasks.add_task(
         _service.start_job, job_id=job_id, source_url=request.rtsp_url
@@ -205,6 +219,7 @@ async def start_rtmp_detection(
         zones=zones or None,
         zone_instructions=zone_instructions or None,
         security_priorities=priorities or None,
+        pose_theft_mode=request.pose_theft_mode,
     )
     background_tasks.add_task(
         _service.start_job, job_id=job_id, source_url=rtmp_url

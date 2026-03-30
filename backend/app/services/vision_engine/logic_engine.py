@@ -7,6 +7,7 @@ from time import time
 from typing import Any, Iterable
 
 import numpy as np
+from scipy.spatial import cKDTree
 from shapely.geometry import Point, Polygon, box
 
 _logger = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ class ObjectState:
     loiter_seconds: float
     erratic: bool
     close_to: list[str] = field(default_factory=list)  # e.g. ["Person#2", "Handbag#5"]
+    keypoints: list | None = field(default=None)
 
 
 class AdvancedLogicEngine:
@@ -75,8 +77,18 @@ class AdvancedLogicEngine:
         # Event hysteresis counters
         self._event_counts = defaultdict(int)
 
+        # Zone hysteresis: (track_id, zone_name) -> consecutive frames inside
+        self._zone_frame_counts: dict[tuple[int, str], int] = {}
+
         # Interaction thresholds
         self._interaction_px = 20.0  # bbox gap < 20px = "touching/near"
+
+        # Perspective scaling (updated each frame from YOLO result)
+        self._frame_height: float = 720.0
+
+        # Ghost state: tracks that disappeared but may reappear (anti-jitter)
+        # track_id -> {"hist": <history dict>, "ttl": int, "entered_frame": int}
+        self._ghost_states: dict[int, dict[str, Any]] = {}
 
         # Object class semantics
         self._person_class_ids = {0}
@@ -91,6 +103,7 @@ class AdvancedLogicEngine:
         }
 
         self.theft_detection_enabled: bool = True
+        self.pose_theft_mode: bool = False
 
         # Event log — rolling buffer of alerts for the LLM
         self._event_log: deque[str] = deque(maxlen=20)
@@ -111,6 +124,8 @@ class AdvancedLogicEngine:
         self._event_log.clear()
         self._timeline.clear()
         self._event_counts.clear()
+        self._zone_frame_counts.clear()
+        self._ghost_states.clear()
         self._frame_index = 0
         self._last_timestamp = None
         self._scene_state = {
@@ -125,14 +140,21 @@ class AdvancedLogicEngine:
         self._zones = {name: Polygon(points) for name, points in zones.items()}
 
     def update(self, yolo_results: dict[str, Any] | list[Any]) -> None:
+        if isinstance(yolo_results, dict) and "frame_height" in yolo_results:
+            self._frame_height = float(yolo_results["frame_height"])
+
         detections = self._normalize_detections(yolo_results)
         if not detections:
             self._advance_time(yolo_results)
             self._scene_state["summary_text"] = "No detections."
             return
 
+        keypoints_map: dict[int, list] = {}
+        if isinstance(yolo_results, dict):
+            keypoints_map = yolo_results.get("keypoints_map", {}) or {}
+
         frame_index, timestamp = self._advance_time(yolo_results)
-        states = self._update_object_history(detections, frame_index, timestamp)
+        states = self._update_object_history(detections, frame_index, timestamp, keypoints_map)
         self._record_timeline(states, timestamp)
         scene_text = self._build_scene_text(states)
         self._scene_state = {
@@ -183,7 +205,8 @@ class AdvancedLogicEngine:
         return detections
 
     def _update_object_history(
-        self, detections: list[dict[str, Any]], frame_index: int, timestamp: float
+        self, detections: list[dict[str, Any]], frame_index: int, timestamp: float,
+        keypoints_map: dict[int, list] | None = None,
     ) -> list[ObjectState]:
         states: list[ObjectState] = []
         seen_ids = set()
@@ -201,6 +224,12 @@ class AdvancedLogicEngine:
                 else center
             )
 
+            if track_id in self._ghost_states:
+                ghost = self._ghost_states.pop(track_id)
+                self._history[track_id] = ghost["hist"]
+                _logger.debug("ghost_restored track_id=%d after %d frames",
+                              track_id, self._max_missing_frames - ghost["ttl"] + 1)
+
             if track_id not in self._history:
                 self._history[track_id] = {
                     "last_center": center,
@@ -215,7 +244,9 @@ class AdvancedLogicEngine:
                 }
             hist = self._history[track_id]
             dt = max(timestamp - hist["last_seen_time"], 1.0 / self._fps)
-            speed = float(np.linalg.norm(center - hist["last_center"]) / dt)
+            raw_speed = float(np.linalg.norm(center - hist["last_center"]) / dt)
+            depth_scale = max(bbox[3] / self._frame_height, 0.1)
+            speed = raw_speed / depth_scale
             hist["speed"] = speed
             hist["speed_hist"].append(speed)
             hist["last_center"] = center
@@ -236,15 +267,28 @@ class AdvancedLogicEngine:
                 )
             prev_zone = hist.get("current_zone")
             hist["current_zone"] = zone
+
             if zone:
                 hist["zone_durations"][zone] += dt
-                if zone != prev_zone:
+                self._zone_frame_counts[(track_id, zone)] = (
+                    self._zone_frame_counts.get((track_id, zone), 0) + 1
+                )
+                for key in [k for k in self._zone_frame_counts if k[0] == track_id and k[1] != zone]:
+                    del self._zone_frame_counts[key]
+                if self._zone_frame_counts[(track_id, zone)] == self._hysteresis_frames:
                     self._event_log.append(
                         f"ZONE_INTRUSION: {class_name}#{track_id} entered zone '{zone}'."
                     )
+            else:
+                for key in [k for k in self._zone_frame_counts if k[0] == track_id]:
+                    del self._zone_frame_counts[key]
 
             speed_hist = np.array(hist["speed_hist"], dtype=float)
             erratic = bool(speed_hist.size >= 3 and speed_hist.std() > self._erratic_std)
+
+            kp = None
+            if self.pose_theft_mode and keypoints_map and track_id in keypoints_map:
+                kp = keypoints_map[track_id]
 
             states.append(
                 ObjectState(
@@ -258,11 +302,15 @@ class AdvancedLogicEngine:
                     zone=zone,
                     loiter_seconds=float(hist["zone_durations"].get(zone, 0.0)) if zone else 0.0,
                     erratic=erratic,
+                    keypoints=kp,
                 )
             )
 
-        # --- Interaction detection (N^2 proximity check) ---
+        # --- Interaction detection ---
         self._detect_interactions(states)
+
+        if self.pose_theft_mode:
+            self._detect_pose_theft_heuristics(states)
 
         # Snapshot close_to back into history for disappearance checks
         for s in states:
@@ -278,18 +326,107 @@ class AdvancedLogicEngine:
     # Interaction detection
     # -----------------------------------------------------------------
     def _detect_interactions(self, objects: list[ObjectState]) -> None:
-        """Populate close_to for each object by checking bbox proximity."""
+        """Populate close_to for each object by checking bbox proximity.
+
+        Uses a KD-Tree on center points as a broad-phase filter, then
+        verifies candidates with exact Shapely bbox distance.
+        """
         n = len(objects)
         if n < 2:
             return
-        # Pre-build shapely boxes
+
+        centers = np.array([obj.center for obj in objects])
+        fh = self._frame_height
+
+        max_threshold = self._interaction_px * max(
+            obj.bbox[3] / fh for obj in objects
+        )
+        tree = cKDTree(centers)
+        candidate_pairs = tree.query_pairs(r=max_threshold + self._interaction_px)
+
+        if not candidate_pairs:
+            return
+
         polys = [box(*obj.bbox.tolist()) for obj in objects]
-        for i in range(n):
-            for j in range(i + 1, n):
-                dist = polys[i].distance(polys[j])
-                if dist < self._interaction_px:
-                    objects[i].close_to.append(f"{objects[j].class_name}#{objects[j].track_id}")
-                    objects[j].close_to.append(f"{objects[i].class_name}#{objects[i].track_id}")
+        for i, j in candidate_pairs:
+            avg_scale = (objects[i].bbox[3] + objects[j].bbox[3]) / (2.0 * fh)
+            threshold = self._interaction_px * max(avg_scale, 0.1)
+            if polys[i].distance(polys[j]) < threshold:
+                objects[i].close_to.append(f"{objects[j].class_name}#{objects[j].track_id}")
+                objects[j].close_to.append(f"{objects[i].class_name}#{objects[i].track_id}")
+
+    # -----------------------------------------------------------------
+    # Pose-based theft heuristics (only when pose_theft_mode is True)
+    # -----------------------------------------------------------------
+    _WRIST_INDICES = (9, 10)   # COCO: left_wrist, right_wrist
+    _HIP_INDICES = (11, 12)    # COCO: left_hip, right_hip
+    _KP_MIN_CONF = 0.3
+    _WRIST_HIP_PX = 30.0      # base proximity threshold (scaled by perspective)
+
+    def _detect_pose_theft_heuristics(self, objects: list[ObjectState]) -> None:
+        """Check wrist-to-item and wrist-to-pocket kinematics for persons."""
+        persons = [o for o in objects if o.class_id in self._person_class_ids and o.keypoints]
+        if not persons:
+            return
+
+        stealables = [
+            o for o in objects
+            if o.class_id in self._stealable_class_ids
+            or o.class_name.lower() in self._stealable_class_names
+        ]
+        stealable_polys = [(s, box(*s.bbox.tolist())) for s in stealables] if stealables else []
+
+        fh = self._frame_height
+
+        for person in persons:
+            kp = person.keypoints
+            if not kp or len(kp) < 13:
+                continue
+
+            wrists: list[tuple[float, float]] = []
+            for idx in self._WRIST_INDICES:
+                pt = kp[idx]
+                if len(pt) >= 3 and pt[2] >= self._KP_MIN_CONF:
+                    wrists.append((pt[0], pt[1]))
+                elif len(pt) >= 2 and pt[0] > 0 and pt[1] > 0:
+                    wrists.append((pt[0], pt[1]))
+
+            if not wrists:
+                continue
+
+            for wx, wy in wrists:
+                wrist_pt = Point(wx, wy)
+                for item, item_poly in stealable_polys:
+                    if item_poly.distance(wrist_pt) < self._interaction_px:
+                        self._event_log.append(
+                            f"POSE_KINEMATIC: Person#{person.track_id} wrist "
+                            f"interacted with {item.class_name}#{item.track_id}"
+                        )
+                        break
+
+            hips: list[tuple[float, float]] = []
+            for idx in self._HIP_INDICES:
+                pt = kp[idx]
+                if len(pt) >= 3 and pt[2] >= self._KP_MIN_CONF:
+                    hips.append((pt[0], pt[1]))
+                elif len(pt) >= 2 and pt[0] > 0 and pt[1] > 0:
+                    hips.append((pt[0], pt[1]))
+
+            if hips:
+                depth_scale = max(person.bbox[3] / fh, 0.1)
+                threshold = self._WRIST_HIP_PX * depth_scale
+                for wx, wy in wrists:
+                    for hx, hy in hips:
+                        dist = float(np.hypot(wx - hx, wy - hy))
+                        if dist < threshold:
+                            self._event_log.append(
+                                f"POSE_KINEMATIC: Person#{person.track_id} "
+                                f"wrist moved to hip/pocket area"
+                            )
+                            break
+                    else:
+                        continue
+                    break
 
     # -----------------------------------------------------------------
     # Disappearance / concealment detection
@@ -300,8 +437,13 @@ class AdvancedLogicEngine:
         seen_ids: set[int],
         frame_index: int,
     ) -> None:
-        """Check stale tracks. If a stealable object vanished while near a
-        person, log a concealment alert instead of silently deleting it."""
+        """Move stale tracks into a ghost state with a TTL before alerting.
+
+        If a track reappears before its TTL expires, it is restored in
+        _update_object_history.  Only when TTL reaches 0 do we evaluate
+        theft/concealment alerts."""
+        _GHOST_TTL = self._max_missing_frames
+
         for track_id, hist in list(self._history.items()):
             if track_id in seen_ids:
                 continue
@@ -309,34 +451,45 @@ class AdvancedLogicEngine:
             if frames_missing <= self._max_missing_frames:
                 continue
 
-            # Track is dead — check if it was a stealable object
+            if track_id not in self._ghost_states:
+                self._ghost_states[track_id] = {
+                    "hist": dict(hist),
+                    "ttl": _GHOST_TTL,
+                    "entered_frame": frame_index,
+                }
+                del self._history[track_id]
+                continue
+
+        for track_id, ghost in list(self._ghost_states.items()):
+            if track_id in seen_ids:
+                continue
+            ghost["ttl"] -= 1
+            if ghost["ttl"] > 0:
+                continue
+
+            hist = ghost["hist"]
             last_class_id = hist.get("class_id", -1)
             last_class_name = hist.get("class_name") or _resolve_class_name(last_class_id, None)
             last_close_to = hist.get("last_close_to", [])
 
-            if not self.theft_detection_enabled:
-                del self._history[track_id]
-                continue
+            if self.theft_detection_enabled:
+                is_stealable = (
+                    last_class_id in self._stealable_class_ids
+                    or last_class_name.lower() in self._stealable_class_names
+                )
+                if is_stealable and last_close_to:
+                    person_neighbors = [
+                        nb for nb in last_close_to
+                        if nb.lower().startswith("person")
+                    ]
+                    if person_neighbors:
+                        self._event_log.append(
+                            f"ALERT: {last_class_name}#{track_id} DISAPPEARED while "
+                            f"close to {', '.join(person_neighbors)}. "
+                            f"Possible theft/concealment."
+                        )
 
-            is_stealable = (
-                last_class_id in self._stealable_class_ids
-                or last_class_name.lower() in self._stealable_class_names
-            )
-
-            if is_stealable and last_close_to:
-                # Check if any neighbor was a person
-                person_neighbors = [
-                    nb for nb in last_close_to
-                    if nb.lower().startswith("person")
-                ]
-                if person_neighbors:
-                    self._event_log.append(
-                        f"ALERT: {last_class_name}#{track_id} DISAPPEARED while "
-                        f"close to {', '.join(person_neighbors)}. "
-                        f"Possible theft/concealment."
-                    )
-
-            del self._history[track_id]
+            del self._ghost_states[track_id]
 
     # -----------------------------------------------------------------
     # Timeline — sliding window of significant snapshots

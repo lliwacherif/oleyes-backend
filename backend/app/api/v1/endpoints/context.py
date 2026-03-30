@@ -84,11 +84,8 @@ async def _refine_context(raw_data: dict) -> str:
         priorities.append("customer analytics")
 
     raw_text = (
-        f"Type: {raw_data.get('business_type', 'N/A')}\n"
-        f"Name: {raw_data.get('business_name', 'N/A')}\n"
-        f"Description: {raw_data.get('short_description', 'N/A')}\n"
-        f"Size: {raw_data.get('business_size', 'N/A')}\n"
-        f"Camera type: {raw_data.get('camera_type', 'N/A')}\n"
+        f"Environment type: {raw_data.get('business_type', 'N/A')}\n"
+        f"Physical description: {raw_data.get('short_description', 'N/A')}\n"
         f"Monitoring priorities: {', '.join(priorities) or 'general surveillance'}"
     )
 

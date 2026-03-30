@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OLEYES — Pose Theft Mode Workflow</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background: #0a0e17; color: #c9d1d9; min-height: 100vh; padding: 40px 20px; }
+  .container { max-width: 900px; margin: 0 auto; }
+  h1 { text-align: center; font-size: 1.6rem; color: #e6edf3; margin-bottom: 6px; letter-spacing: -0.5px; }
+  .subtitle { text-align: center; font-size: 0.85rem; color: #7d8590; margin-bottom: 48px; }
+  .phase { margin-bottom: 40px; position: relative; padding-left: 48px; }
+  .phase::before { content: ''; position: absolute; left: 18px; top: 36px; bottom: -40px; width: 2px; background: linear-gradient(to bottom, #2f81f7, #2f81f7 60%, transparent); }
+  .phase:last-child::before { display: none; }
+  .phase-number { position: absolute; left: 0; top: 0; width: 38px; height: 38px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 0.9rem; z-index: 1; }
+  .phase-number.user { background: #1a3a5c; color: #58a6ff; border: 2px solid #2f81f7; }
+  .phase-number.frontend { background: #2a1a3c; color: #bc8cff; border: 2px solid #8b5cf6; }
+  .phase-number.backend { background: #1a2e1a; color: #7ee787; border: 2px solid #3fb950; }
+  .phase-number.ai { background: #3a2a1a; color: #f0b860; border: 2px solid #d29922; }
+  .phase-number.output { background: #1a2a2e; color: #56d4dd; border: 2px solid #39c5cf; }
+  .card { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 20px 24px; }
+  .card-label { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 1.5px; font-weight: 600; margin-bottom: 8px; }
+  .card-label.user { color: #58a6ff; }
+  .card-label.frontend { color: #bc8cff; }
+  .card-label.backend { color: #7ee787; }
+  .card-label.ai { color: #f0b860; }
+  .card-label.output { color: #56d4dd; }
+  .card h3 { font-size: 1.05rem; color: #e6edf3; margin-bottom: 10px; font-weight: 600; }
+  .card p { font-size: 0.88rem; line-height: 1.65; color: #8b949e; }
+  .card p strong { color: #c9d1d9; font-weight: 600; }
+  .arrow-box { display: inline-block; background: #1c2333; border: 1px solid #30363d; border-radius: 6px; padding: 3px 10px; font-size: 0.78rem; color: #7d8590; margin: 4px 2px; font-family: 'Consolas', 'Fira Code', monospace; }
+  .divider { border: none; border-top: 1px dashed #21262d; margin: 48px 0 12px 0; }
+  .comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 48px; }
+  .compare-card { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 20px; }
+  .compare-card h4 { font-size: 0.9rem; margin-bottom: 12px; }
+  .compare-card.standard h4 { color: #8b949e; }
+  .compare-card.pose h4 { color: #7ee787; }
+  .compare-card ul { list-style: none; padding: 0; }
+  .compare-card li { font-size: 0.82rem; color: #8b949e; padding: 5px 0; padding-left: 18px; position: relative; line-height: 1.5; }
+  .compare-card li::before { content: ''; position: absolute; left: 0; top: 11px; width: 8px; height: 8px; border-radius: 50%; }
+  .compare-card.standard li::before { background: #30363d; }
+  .compare-card.pose li::before { background: #3fb950; }
+  .footer { text-align: center; margin-top: 56px; font-size: 0.75rem; color: #484f58; }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <h1>Advanced Theft Mode (Pose AI) — Workflow</h1>
+  <p class="subtitle">What happens when the toggle is ON and the user clicks EXECUTE</p>
+
+  <!-- Phase 1 -->
+  <div class="phase">
+    <div class="phase-number user">1</div>
+    <div class="card">
+      <div class="card-label user">User Action</div>
+      <h3>Toggle ON in Settings</h3>
+      <p>User flips <strong>"Advanced Theft Mode (Pose AI)"</strong> to ON. The frontend saves <span class="arrow-box">poseTheftMode = true</span> to localStorage. This persists across page reloads.</p>
+    </div>
+  </div>
+
+  <!-- Phase 2 -->
+  <div class="phase">
+    <div class="phase-number frontend">2</div>
+    <div class="card">
+      <div class="card-label frontend">Frontend</div>
+      <h3>EXECUTE Button → API Call</h3>
+      <p>User clicks <strong>EXECUTE</strong> on a camera. The frontend reads the setting from context and sends the POST request with <span class="arrow-box">pose_theft_mode: true</span> in the JSON body alongside <span class="arrow-box">rtsp_url</span>, <span class="arrow-box">camera_id</span>, etc.</p>
+    </div>
+  </div>
+
+  <!-- Phase 3 -->
+  <div class="phase">
+    <div class="phase-number backend">3</div>
+    <div class="card">
+      <div class="card-label backend">Backend — Model Switch</div>
+      <h3>Load YOLO-Pose Instead of Standard YOLO</h3>
+      <p>The backend sees <span class="arrow-box">pose_theft_mode = True</span> and loads <strong>yolo26n-pose.pt</strong> (skeleton model) instead of the standard <strong>yolo26n.pt</strong> (bounding-box only). Both models stay in memory — no reload needed on the next job.</p>
+    </div>
+  </div>
+
+  <!-- Phase 4 -->
+  <div class="phase">
+    <div class="phase-number backend">4</div>
+    <div class="card">
+      <div class="card-label backend">Backend — Frame Processing</div>
+      <h3>Extract Bounding Boxes + 17 Skeleton Keypoints</h3>
+      <p>Each video frame goes through the pose model. The backend extracts the usual bounding boxes <strong>plus</strong> 17 COCO keypoints per person (nose, eyes, shoulders, elbows, <strong>wrists</strong>, <strong>hips</strong>, knees, ankles). These keypoints are passed into the Logic Engine.</p>
+    </div>
+  </div>
+
+  <!-- Phase 5 -->
+  <div class="phase">
+    <div class="phase-number ai">5</div>
+    <div class="card">
+      <div class="card-label ai">Logic Engine — Kinematic Analysis</div>
+      <h3>Detect Hand-to-Item and Hand-to-Pocket</h3>
+      <p>The Logic Engine runs two geometric checks every frame:</p>
+      <p style="margin-top:8px"><strong>1. Wrist → Item:</strong> Is either wrist (keypoints 9, 10) overlapping or touching a stealable object's bounding box (handbag, phone, laptop, etc.)?<br>
+      If yes → log <span class="arrow-box">POSE_KINEMATIC: Person#3 wrist interacted with Handbag#7</span></p>
+      <p style="margin-top:8px"><strong>2. Wrist → Hip:</strong> Is either wrist close to either hip (keypoints 11, 12) on the same person?<br>
+      If yes → log <span class="arrow-box">POSE_KINEMATIC: Person#3 wrist moved to hip/pocket area</span></p>
+    </div>
+  </div>
+
+  <!-- Phase 6 -->
+  <div class="phase">
+    <div class="phase-number ai">6</div>
+    <div class="card">
+      <div class="card-label ai">LLM Analysis — Pre-Crime Sequence</div>
+      <h3>Specialized Theft Prompt Sent to LLM</h3>
+      <p>The scene text (with kinematic events) is batched and sent to the LLM with a <strong>specialized prompt</strong> that replaces the standard theft rule:</p>
+      <p style="margin-top:8px; font-style:italic; color:#c9a04f; line-height:1.7">
+        "ADVANCED POSE THEFT MODE: Look for the Pre-Crime Sequence —<br>
+        &nbsp;&nbsp;1. <strong>Browsing</strong> (wrist interacts with item)<br>
+        &nbsp;&nbsp;2. <strong>Concealment</strong> (wrist moves to hip/pocket/backpack)<br>
+        &nbsp;&nbsp;3. <strong>Flight</strong> (item disappears, person speeds up or leaves)<br>
+        If you see Concealment followed by the item disappearing, flag as HIGH RISK THEFT immediately."
+      </p>
+    </div>
+  </div>
+
+  <!-- Phase 7 -->
+  <div class="phase">
+    <div class="phase-number output">7</div>
+    <div class="card">
+      <div class="card-label output">SSE Stream → Dashboard</div>
+      <h3>Results Streamed Back to the UI</h3>
+      <p>The LLM responds with a risk score, label, and explanation. This is streamed to the frontend via the <strong>same SSE connection</strong> in the <strong>same JSON format</strong> as standard mode. The dashboard displays the risk level, alerts, and zone intrusions as usual — no UI parsing changes needed.</p>
+    </div>
+  </div>
+
+  <hr class="divider">
+
+  <!-- Side-by-side comparison -->
+  <div class="comparison">
+    <div class="compare-card standard">
+      <h4>Standard Mode (Toggle OFF)</h4>
+      <ul>
+        <li>Uses yolo26n.pt (bounding boxes only)</li>
+        <li>Proximity = box-to-box distance</li>
+        <li>Theft = item disappears near person</li>
+        <li>No skeleton or keypoint data</li>
+        <li>Standard temporal theft prompt to LLM</li>
+      </ul>
+    </div>
+    <div class="compare-card pose">
+      <h4>Pose Theft Mode (Toggle ON)</h4>
+      <ul>
+        <li>Uses yolo26n-pose.pt (boxes + 17 keypoints)</li>
+        <li>Wrist-to-item geometric intersection</li>
+        <li>Wrist-to-hip concealment detection</li>
+        <li>Pre-crime sequence: Browse → Conceal → Flight</li>
+        <li>Specialized kinematic theft prompt to LLM</li>
+      </ul>
+    </div>
+  </div>
+
+  <p class="footer">OLEYES — Pose Theft Mode Workflow Documentation</p>
+
+</div>
+</body>
+</html>
