@@ -1040,10 +1040,8 @@ class Yolo26Service:
 
             if i < len(frames) - 1:
                 if "CURRENT STATE:" in scene_text:
-                    parts = scene_text.split("CURRENT STATE:")
-                    if len(parts) > 1:
-                        parsed_state = parts[1].strip()
-                        texts.append(f"Frame {frame_idx} CURRENT STATE:\n{parsed_state}")
+                    _, _, parsed_state = scene_text.partition("CURRENT STATE:")
+                    texts.append(f"Frame {frame_idx} CURRENT STATE:\n{parsed_state.strip()}")
                 else:
                     texts.append(f"Frame {frame_idx} CURRENT STATE:\n{scene_text.strip()}")
             else:
