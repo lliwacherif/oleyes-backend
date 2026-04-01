@@ -265,12 +265,16 @@ class _FrameGrabber:
                     reconnects, _RTMP_MAX_RECONNECTS, self._url,
                 )
                 time.sleep(_RTMP_RECONNECT_DELAY)
-                saved = os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
+                saved_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+                opts = "fflags;nobuffer|flags;low_delay|analyzeduration;0|probesize;32"
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = opts
                 try:
                     self._cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
                 finally:
-                    if saved is not None:
-                        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = saved
+                    if saved_opts is not None:
+                        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = saved_opts
+                    elif "OPENCV_FFMPEG_CAPTURE_OPTIONS" in os.environ:
+                        del os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"]
                 if not self._cap.isOpened():
                     self._cap.release()
                     logger.warning("grabber_rtmp_reconnect_failed url=%s", self._url)
@@ -316,20 +320,20 @@ def _encode_frame(frame: np.ndarray) -> bytes | None:
 # ---------------------------------------------------------------------------
 
 def _open_capture(url: str, is_rtmp: bool = False) -> cv2.VideoCapture | None:
-    """Open an RTSP or RTMP stream via FFmpeg.
+    """Open an RTSP or RTMP stream via FFmpeg using zero-latency buffers to eliminate decoding lag."""
+    saved_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+    opts = "fflags;nobuffer|flags;low_delay|analyzeduration;0|probesize;32"
+    if not is_rtmp:
+        opts = "rtsp_transport;tcp|" + opts
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = opts
 
-    For RTMP, the global OPENCV_FFMPEG_CAPTURE_OPTIONS (which contains
-    RTSP-specific stimeout) is temporarily cleared to avoid corrupting
-    RTMP's listen_timeout parameter.
-    """
-    saved_opts = None
-    if is_rtmp:
-        saved_opts = os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
     try:
         cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
     finally:
         if saved_opts is not None:
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = saved_opts
+        elif "OPENCV_FFMPEG_CAPTURE_OPTIONS" in os.environ:
+            del os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"]
 
     if not cap.isOpened():
         cap.release()
@@ -401,6 +405,7 @@ def _mjpeg_generator(grabber: _FrameGrabber):
 
     try:
         while empty_cycles < _MAX_CONSECUTIVE_DROPS:
+            t0 = time.time()
             frame = grabber.get_frame()
             if frame is None:
                 empty_cycles += 1
@@ -411,6 +416,7 @@ def _mjpeg_generator(grabber: _FrameGrabber):
             data = _encode_frame(frame)
             if data is None:
                 continue
+                
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n"
@@ -418,7 +424,9 @@ def _mjpeg_generator(grabber: _FrameGrabber):
                 + data
                 + b"\r\n"
             )
-            time.sleep(interval)
+            
+            elapsed = time.time() - t0
+            time.sleep(max(0, interval - elapsed))
     finally:
         grabber.stop()
 
