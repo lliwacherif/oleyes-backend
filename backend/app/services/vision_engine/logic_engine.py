@@ -59,6 +59,8 @@ class ObjectState:
     keypoints: list | None = field(default=None)
     theft_stage: str = field(default="NONE")
     last_kinematic_time: float = field(default=0.0)
+    last_keypoints: list | None = field(default=None)
+    kp_ttl: int = field(default=0)
 
 
 class AdvancedLogicEngine:
@@ -249,6 +251,8 @@ class AdvancedLogicEngine:
                     "last_close_to": [],
                     "theft_stage": "NONE",
                     "last_kinematic_time": 0.0,
+                    "last_keypoints": None,
+                    "kp_ttl": 0,
                 }
             hist = self._history[track_id]
             dt = max(timestamp - hist["last_seen_time"], 1.0 / self._fps)
@@ -298,6 +302,13 @@ class AdvancedLogicEngine:
             if self.pose_theft_mode and keypoints_map and track_id in keypoints_map:
                 kp = keypoints_map[track_id]
 
+            if kp is not None:
+                hist["last_keypoints"] = kp
+                hist["kp_ttl"] = 5
+            elif hist.get("kp_ttl", 0) > 0:
+                kp = hist.get("last_keypoints")
+                hist["kp_ttl"] -= 1
+
             states.append(
                 ObjectState(
                     track_id=track_id,
@@ -313,6 +324,8 @@ class AdvancedLogicEngine:
                     keypoints=kp,
                     theft_stage=hist.get("theft_stage", "NONE"),
                     last_kinematic_time=hist.get("last_kinematic_time", 0.0),
+                    last_keypoints=hist.get("last_keypoints"),
+                    kp_ttl=hist.get("kp_ttl", 0),
                 )
             )
 
@@ -374,7 +387,7 @@ class AdvancedLogicEngine:
     _WRIST_INDICES = (9, 10)   # COCO: left_wrist, right_wrist
     _HIP_INDICES = (11, 12)    # COCO: left_hip, right_hip
     _KP_MIN_CONF = 0.3
-    _WRIST_HIP_PX = 30.0      # base proximity threshold (scaled by perspective)
+    _WRIST_HIP_PX = 100.0      # base proximity threshold (scaled by perspective)
 
     _STAGE_TIMEOUT = 5.0  # seconds between BROWSING -> CONCEALING
 
@@ -425,11 +438,17 @@ class AdvancedLogicEngine:
                 if item_touched:
                     break
 
-            if item_touched and person.theft_stage == "NONE":
-                person.theft_stage = "BROWSING"
+            if item_touched:
                 person.last_kinematic_time = now
+                if person.theft_stage == "NONE":
+                    person.theft_stage = "BROWSING"
+                    self._event_log.append(
+                        f"STATE_CHANGE: Person#{person.track_id} entered BROWSING stage"
+                    )
+            elif person.theft_stage == "BROWSING" and (now - person.last_kinematic_time) > 10.0:
+                person.theft_stage = "NONE"
                 self._event_log.append(
-                    f"STATE_CHANGE: Person#{person.track_id} entered BROWSING stage"
+                    f"STATE_CHANGE: Person#{person.track_id} returned to NONE stage (idle)"
                 )
 
             # --- Wrist-to-Hip / Wrist-to-Torso (CONCEALING) ---
@@ -513,9 +532,21 @@ class AdvancedLogicEngine:
                 continue
 
             if track_id not in self._ghost_states:
+                ttl = _GHOST_TTL
+                if self.pose_theft_mode:
+                    for nb in hist.get("last_close_to", []):
+                        if nb.lower().startswith("person"):
+                            import re as _re
+                            m = _re.search(r"#(\d+)", nb)
+                            if m:
+                                ptid = int(m.group(1))
+                                phist = self._history.get(ptid)
+                                if phist and phist.get("theft_stage") in ("BROWSING", "CONCEALING"):
+                                    ttl = 60  # Extended TTL for concealment sequences
+
                 self._ghost_states[track_id] = {
                     "hist": dict(hist),
-                    "ttl": _GHOST_TTL,
+                    "ttl": ttl,
                     "entered_frame": frame_index,
                 }
                 del self._history[track_id]

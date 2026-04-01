@@ -328,32 +328,41 @@ class Yolo26Service:
     _POSE_GATE_PX = 150.0
 
     @staticmethod
+    def _dist_rects(a: list[float], b: list[float]) -> float:
+        ix1 = max(a[0], b[0])
+        iy1 = max(a[1], b[1])
+        ix2 = min(a[2], b[2])
+        iy2 = min(a[3], b[3])
+        if ix1 < ix2 and iy1 < iy2:
+            return 0.0
+        import numpy as _np
+        return float(_np.hypot(max(0.0, ix1 - ix2), max(0.0, iy1 - iy2)))
+
+    @staticmethod
     def _should_run_pose(std_result) -> bool:
         """Return True only if the frame has a person within proximity of a stealable item."""
-        import numpy as _np
         boxes = getattr(std_result, "boxes", None)
         if boxes is None or boxes.xyxy is None:
             return False
-        person_centers = []
-        item_centers = []
+        person_rects = []
+        item_rects = []
         for b in boxes:
             cls_id = int(b.cls.item()) if b.cls is not None else -1
             xyxy = b.xyxy.tolist()[0]
-            cx = (xyxy[0] + xyxy[2]) / 2.0
-            cy = (xyxy[1] + xyxy[3]) / 2.0
             if cls_id == 0:
-                person_centers.append((cx, cy))
+                person_rects.append(xyxy)
             elif cls_id in Yolo26Service._STEALABLE_CLS:
-                item_centers.append((cx, cy))
-        if not person_centers or not item_centers:
+                item_rects.append(xyxy)
+        if not person_rects or not item_rects:
             return False
-        for pcx, pcy in person_centers:
-            for icx, icy in item_centers:
-                if _np.hypot(pcx - icx, pcy - icy) < Yolo26Service._POSE_GATE_PX:
+        for pr in person_rects:
+            for ir in item_rects:
+                if Yolo26Service._dist_rects(pr, ir) < Yolo26Service._POSE_GATE_PX:
                     return True
         return False
 
-    _POSE_IOU_THRESH = 0.60
+    _POSE_IOU_THRESH = 0.30
+    _POSE_FALLBACK_PX = 50.0
 
     @staticmethod
     def _iou(a: list[float], b: list[float]) -> float:
@@ -371,7 +380,7 @@ class Yolo26Service:
     @staticmethod
     def _merge_pose_keypoints(std_boxes, pose_result) -> dict[int, list]:
         """Map keypoints from a separate pose prediction to the tracked
-        person boxes from the standard model using IoU-based matching."""
+        person boxes from the standard model using IoU and Center-Fallback matching."""
         if std_boxes is None or std_boxes.xyxy is None:
             return {}
 
@@ -401,9 +410,14 @@ class Yolo26Service:
             if track_id == -1:
                 continue
             sxyxy = sb.xyxy.tolist()[0]
+            scx = (sxyxy[0] + sxyxy[2]) / 2.0
+            scy = (sxyxy[1] + sxyxy[3]) / 2.0
 
             best_iou = 0.0
             best_idx = -1
+            best_dist = float('inf')
+            best_dist_idx = -1
+
             for pxyxy, pidx in pose_bboxes:
                 if pidx in used_pose:
                     continue
@@ -412,9 +426,19 @@ class Yolo26Service:
                     best_iou = score
                     best_idx = pidx
 
+                pcx = (pxyxy[0] + pxyxy[2]) / 2.0
+                pcy = (pxyxy[1] + pxyxy[3]) / 2.0
+                dist = ((scx - pcx) ** 2 + (scy - pcy) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_dist_idx = pidx
+
             if best_idx >= 0 and best_iou >= Yolo26Service._POSE_IOU_THRESH:
                 keypoints_map[track_id] = pose_kpts_data[best_idx].tolist()
                 used_pose.add(best_idx)
+            elif best_dist_idx >= 0 and best_dist < Yolo26Service._POSE_FALLBACK_PX:
+                keypoints_map[track_id] = pose_kpts_data[best_dist_idx].tolist()
+                used_pose.add(best_dist_idx)
 
         return keypoints_map
 
