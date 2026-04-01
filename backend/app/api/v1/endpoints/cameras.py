@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/cameras")
 
 _LIVE_FPS = 15
-_MAX_CONSECUTIVE_DROPS = 30
+_MAX_CONSECUTIVE_DROPS = 300
 _CONNECT_TIMEOUT_S = 10
 _RTMP_RECONNECT_DELAY = 2.0
 _RTMP_MAX_RECONNECTS = 5
