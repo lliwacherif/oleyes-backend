@@ -154,7 +154,7 @@ class AdvancedLogicEngine:
         detections = self._normalize_detections(yolo_results)
         if not detections:
             self._advance_time(yolo_results)
-            self._scene_state["summary_text"] = "No detections."
+            self._scene_state["scene_text"] = "No detections."
             return
 
         keypoints_map: dict[int, list] = {}
@@ -304,7 +304,7 @@ class AdvancedLogicEngine:
 
             if kp is not None:
                 hist["last_keypoints"] = kp
-                hist["kp_ttl"] = 5
+                hist["kp_ttl"] = 15
             elif hist.get("kp_ttl", 0) > 0:
                 kp = hist.get("last_keypoints")
                 hist["kp_ttl"] -= 1
@@ -388,11 +388,21 @@ class AdvancedLogicEngine:
     _HIP_INDICES = (11, 12)    # COCO: left_hip, right_hip
     _KP_MIN_CONF = 0.3
     _WRIST_HIP_PX = 100.0      # base proximity threshold (scaled by perspective)
+    _BROWSING_TOUCH_PX = 80.0   # wrist-to-item base distance (scaled by perspective)
 
-    _STAGE_TIMEOUT = 5.0  # seconds between BROWSING -> CONCEALING
+    _STAGE_TIMEOUT = 15.0       # max seconds between BROWSING -> CONCEALING
+    _BROWSING_IDLE_TIMEOUT = 30.0  # seconds without interaction before reset to NONE
+    _CONCEALING_TIMEOUT = 20.0  # seconds in CONCEALING before reset if no FLIGHT
+    _FLIGHT_SPEED = 60.0        # perspective-normalized speed threshold for FLIGHT
 
     def _detect_pose_theft_heuristics(self, objects: list[ObjectState]) -> None:
-        """Kinematic checks with deterministic state machine transitions."""
+        """Kinematic checks with deterministic state machine transitions.
+
+        State machine: NONE -> BROWSING -> CONCEALING -> FLIGHT
+        BROWSING: wrist touches a stealable item (perspective-scaled distance)
+        CONCEALING: wrist moves AWAY from item and INTO hip/torso area
+        FLIGHT: person starts moving after concealment, OR item disappears
+        """
         persons = [o for o in objects if o.class_id in self._person_class_ids and o.keypoints]
         if not persons:
             return
@@ -423,20 +433,24 @@ class AdvancedLogicEngine:
             if not wrists:
                 continue
 
+            depth_scale = max(person.bbox[3] / fh, 0.1)
+            item_threshold = self._BROWSING_TOUCH_PX * depth_scale
+
             # --- Wrist-to-Item (BROWSING) ---
             item_touched = False
-            for wx, wy in wrists:
-                wrist_pt = Point(wx, wy)
-                for item, item_poly in stealable_polys:
-                    if item_poly.distance(wrist_pt) < self._interaction_px:
-                        self._event_log.append(
-                            f"POSE_KINEMATIC: Person#{person.track_id} wrist "
-                            f"interacted with {item.class_name}#{item.track_id}"
-                        )
-                        item_touched = True
+            if stealable_polys:
+                for wx, wy in wrists:
+                    wrist_pt = Point(wx, wy)
+                    for item, item_poly in stealable_polys:
+                        if item_poly.distance(wrist_pt) < item_threshold:
+                            self._event_log.append(
+                                f"POSE_KINEMATIC: Person#{person.track_id} wrist "
+                                f"interacted with {item.class_name}#{item.track_id}"
+                            )
+                            item_touched = True
+                            break
+                    if item_touched:
                         break
-                if item_touched:
-                    break
 
             if item_touched:
                 person.last_kinematic_time = now
@@ -445,57 +459,75 @@ class AdvancedLogicEngine:
                     self._event_log.append(
                         f"STATE_CHANGE: Person#{person.track_id} entered BROWSING stage"
                     )
-            elif person.theft_stage == "BROWSING" and (now - person.last_kinematic_time) > 10.0:
+
+            # --- Idle timeout: BROWSING -> NONE ---
+            if (
+                not item_touched
+                and person.theft_stage == "BROWSING"
+                and (now - person.last_kinematic_time) > self._BROWSING_IDLE_TIMEOUT
+            ):
                 person.theft_stage = "NONE"
                 self._event_log.append(
-                    f"STATE_CHANGE: Person#{person.track_id} returned to NONE stage (idle)"
+                    f"STATE_CHANGE: Person#{person.track_id} returned to NONE (idle timeout)"
+                )
+
+            # --- Idle timeout: CONCEALING -> NONE ---
+            if (
+                person.theft_stage == "CONCEALING"
+                and (now - person.last_kinematic_time) > self._CONCEALING_TIMEOUT
+            ):
+                person.theft_stage = "NONE"
+                self._event_log.append(
+                    f"STATE_CHANGE: Person#{person.track_id} returned to NONE (concealment timeout)"
                 )
 
             # --- Wrist-to-Hip / Wrist-to-Torso (CONCEALING) ---
-            hips: list[tuple[float, float]] = []
-            for idx in self._HIP_INDICES:
-                pt = kp[idx]
-                if len(pt) >= 3 and pt[2] >= self._KP_MIN_CONF:
-                    hips.append((pt[0], pt[1]))
-                elif len(pt) >= 2 and pt[0] > 0 and pt[1] > 0:
-                    hips.append((pt[0], pt[1]))
-
-            depth_scale = max(person.bbox[3] / fh, 0.1)
+            # Only check when wrist is NOT currently touching an item.
+            # Physically: person grabbed item, then moved hand to pocket/torso.
             concealment_threshold = self._WRIST_HIP_PX * depth_scale
             concealment_detected = False
 
-            if hips:
-                for wx, wy in wrists:
-                    for hx, hy in hips:
-                        if float(np.hypot(wx - hx, wy - hy)) < concealment_threshold:
-                            self._event_log.append(
-                                f"POSE_KINEMATIC: Person#{person.track_id} "
-                                f"wrist moved to hip/pocket area"
-                            )
-                            concealment_detected = True
-                            break
-                    if concealment_detected:
-                        break
-
-            if not concealment_detected:
-                torso_pts: list[tuple[float, float]] = []
-                for idx in self._SHOULDER_INDICES + self._HIP_INDICES:
+            if not item_touched:
+                hips: list[tuple[float, float]] = []
+                for idx in self._HIP_INDICES:
                     pt = kp[idx]
                     if len(pt) >= 3 and pt[2] >= self._KP_MIN_CONF:
-                        torso_pts.append((pt[0], pt[1]))
+                        hips.append((pt[0], pt[1]))
                     elif len(pt) >= 2 and pt[0] > 0 and pt[1] > 0:
-                        torso_pts.append((pt[0], pt[1]))
-                if len(torso_pts) >= 2:
-                    tcx = sum(p[0] for p in torso_pts) / len(torso_pts)
-                    tcy = sum(p[1] for p in torso_pts) / len(torso_pts)
+                        hips.append((pt[0], pt[1]))
+
+                if hips:
                     for wx, wy in wrists:
-                        if float(np.hypot(wx - tcx, wy - tcy)) < concealment_threshold:
-                            self._event_log.append(
-                                f"POSE_KINEMATIC: Person#{person.track_id} "
-                                f"wrist moved to inner jacket/torso area"
-                            )
-                            concealment_detected = True
+                        for hx, hy in hips:
+                            if float(np.hypot(wx - hx, wy - hy)) < concealment_threshold:
+                                self._event_log.append(
+                                    f"POSE_KINEMATIC: Person#{person.track_id} "
+                                    f"wrist moved to hip/pocket area"
+                                )
+                                concealment_detected = True
+                                break
+                        if concealment_detected:
                             break
+
+                if not concealment_detected:
+                    torso_pts: list[tuple[float, float]] = []
+                    for idx in self._SHOULDER_INDICES + self._HIP_INDICES:
+                        pt = kp[idx]
+                        if len(pt) >= 3 and pt[2] >= self._KP_MIN_CONF:
+                            torso_pts.append((pt[0], pt[1]))
+                        elif len(pt) >= 2 and pt[0] > 0 and pt[1] > 0:
+                            torso_pts.append((pt[0], pt[1]))
+                    if len(torso_pts) >= 2:
+                        tcx = sum(p[0] for p in torso_pts) / len(torso_pts)
+                        tcy = sum(p[1] for p in torso_pts) / len(torso_pts)
+                        for wx, wy in wrists:
+                            if float(np.hypot(wx - tcx, wy - tcy)) < concealment_threshold:
+                                self._event_log.append(
+                                    f"POSE_KINEMATIC: Person#{person.track_id} "
+                                    f"wrist moved to inner jacket/torso area"
+                                )
+                                concealment_detected = True
+                                break
 
             if (
                 concealment_detected
@@ -506,6 +538,18 @@ class AdvancedLogicEngine:
                 person.last_kinematic_time = now
                 self._event_log.append(
                     f"STATE_CHANGE: Person#{person.track_id} entered CONCEALING stage"
+                )
+
+            # --- Speed-based FLIGHT: person concealed item and is now moving ---
+            if (
+                person.theft_stage == "CONCEALING"
+                and person.speed >= self._FLIGHT_SPEED
+                and (now - person.last_kinematic_time) > 1.0
+            ):
+                person.theft_stage = "FLIGHT"
+                self._event_log.append(
+                    f"STATE_CHANGE: Person#{person.track_id} entered FLIGHT stage "
+                    f"— moving at {person.speed:.0f}px/s after concealment"
                 )
 
     # -----------------------------------------------------------------
@@ -598,34 +642,25 @@ class AdvancedLogicEngine:
             del self._ghost_states[track_id]
 
     # -----------------------------------------------------------------
-    # Timeline — sliding window of significant snapshots
+    # Timeline — structured per-object snapshots for delta computation
     # -----------------------------------------------------------------
     def _record_timeline(self, states: list[ObjectState], timestamp: float) -> None:
-        """Capture a short summary of active objects for the sliding window."""
-        entries: list[str] = []
+        snapshot: dict[str, Any] = {"timestamp": timestamp, "objects": {}}
         for obj in states:
-            if self._is_static(obj):
-                continue
-            parts_obj: list[str] = []
-            if obj.speed >= self._running_speed:
-                parts_obj.append(f"FAST ({obj.speed:.0f}px/s)")
-            elif obj.speed < 5:
-                parts_obj.append("Stationary")
-            else:
-                parts_obj.append(f"Moving ({obj.speed:.0f}px/s)")
-            if obj.erratic:
-                parts_obj.append("Erratic")
-            if obj.close_to:
-                parts_obj.append(f"near [{', '.join(obj.close_to)}]")
             cx = float(obj.center[0]) if obj.center is not None else 0.0
             cy = float(obj.center[1]) if obj.center is not None else 0.0
-            grid = self._get_grid_position(cx, cy)
-            entries.append(f"{obj.class_name}#{obj.track_id}: {', '.join(parts_obj)} [Grid: {grid}]")
-
-        self._timeline.append({
-            "timestamp": timestamp,
-            "summary": "; ".join(entries) if entries else "No active objects",
-        })
+            snapshot["objects"][obj.track_id] = {
+                "class_name": obj.class_name,
+                "class_id": obj.class_id,
+                "speed": obj.speed,
+                "center": (cx, cy),
+                "grid": self._get_grid_position(cx, cy),
+                "erratic": obj.erratic,
+                "close_to": list(obj.close_to),
+                "zone": obj.zone,
+                "is_static": self._is_static(obj),
+            }
+        self._timeline.append(snapshot)
 
     # -----------------------------------------------------------------
     # Spatial grid helper
@@ -643,77 +678,275 @@ class AdvancedLogicEngine:
         return f"{row}-{col}"
 
     # -----------------------------------------------------------------
-    # Build final scene text for the LLM
+    # Semantic scene text — helpers
     # -----------------------------------------------------------------
+    _WALK_SPEED = 80.0
+    _FAST_SPEED = 200.0
+
+    _PLURALS: dict[str, str] = {
+        "person": "people", "mouse": "mice", "knife": "knives",
+    }
+
     @staticmethod
     def _is_static(obj: ObjectState) -> bool:
         if obj.class_id == 0:
             return False
         return obj.speed < 15 and not obj.erratic
 
-    def _build_scene_text(
-        self, objects: list[ObjectState]
-    ) -> str:
+    def _classify_motion(self, speed: float, is_person: bool) -> str:
+        if is_person:
+            if speed < 5:
+                return "Stationary"
+            if speed < self._WALK_SPEED:
+                return "Walking"
+            if speed < self._FAST_SPEED:
+                return "Fast movement"
+            return "Running"
+        return "Stationary" if speed < 15 else "DISPLACED"
+
+    @classmethod
+    def _pluralize(cls, name: str, count: int) -> str:
+        if count == 1:
+            return f"1 {name.lower()}"
+        plural = cls._PLURALS.get(name.lower(), f"{name.lower()}s")
+        return f"{count} {plural}"
+
+    def _describe_direction(self, track_id: int, cx: float, cy: float) -> str:
+        if len(self._timeline) < 2:
+            return ""
+        prev = self._timeline[0].get("objects", {}).get(track_id)
+        if not prev:
+            return ""
+        dx = cx - prev["center"][0]
+        dy = cy - prev["center"][1]
+        if abs(dx) < 15 and abs(dy) < 15:
+            return ""
+        parts: list[str] = []
+        if dy < -15:
+            parts.append("upward")
+        elif dy > 15:
+            parts.append("downward")
+        if dx < -15:
+            parts.append("left")
+        elif dx > 15:
+            parts.append("right")
+        return f"heading {'-'.join(parts)}" if parts else ""
+
+    # -----------------------------------------------------------------
+    # Semantic scene text — section builders
+    # -----------------------------------------------------------------
+
+    def _build_scene_line(self, objects: list[ObjectState]) -> str:
+        type_groups: dict[str, dict[str, int]] = {}
+        for obj in objects:
+            name = obj.class_name
+            if name not in type_groups:
+                type_groups[name] = {"total": 0, "stationary": 0, "active": 0}
+            type_groups[name]["total"] += 1
+            if self._is_static(obj):
+                type_groups[name]["stationary"] += 1
+            else:
+                type_groups[name]["active"] += 1
+
+        parts: list[str] = []
+        for name in sorted(
+            type_groups,
+            key=lambda n: (0 if n == "Person" else 1, -type_groups[n]["total"]),
+        ):
+            g = type_groups[name]
+            count = g["total"]
+            is_person = name == "Person"
+            label = self._pluralize(name, count)
+
+            if g["stationary"] == count:
+                parts.append(f"{label} (stationary)")
+            elif g["active"] == count:
+                parts.append(label if is_person else f"{label} (displaced)")
+            else:
+                if is_person:
+                    parts.append(label)
+                else:
+                    parts.append(
+                        f"{label} ({g['stationary']} stationary, {g['active']} displaced)"
+                    )
+
+        return f"SCENE: {', '.join(parts)}" if parts else "SCENE: Empty"
+
+    def _build_behavior_section(self, objects: list[ObjectState]) -> list[str]:
+        lines: list[str] = []
+        oldest = self._timeline[0] if len(self._timeline) >= 2 else None
+
+        for obj in objects:
+            if self._is_static(obj):
+                continue
+
+            is_person = obj.class_id in self._person_class_ids
+            current_motion = self._classify_motion(obj.speed, is_person)
+
+            prev_motion = None
+            was_static = False
+            if oldest:
+                prev = oldest.get("objects", {}).get(obj.track_id)
+                if prev:
+                    prev_motion = self._classify_motion(prev["speed"], is_person)
+                    was_static = prev["is_static"]
+
+            cx = float(obj.center[0]) if obj.center is not None else 0.0
+            cy = float(obj.center[1]) if obj.center is not None else 0.0
+            grid = self._get_grid_position(cx, cy)
+            direction = self._describe_direction(obj.track_id, cx, cy)
+
+            desc: list[str] = []
+
+            if is_person:
+                if prev_motion and prev_motion != current_motion:
+                    desc.append(f"Changed from {prev_motion} to {current_motion}")
+                else:
+                    desc.append(current_motion)
+                if obj.erratic:
+                    desc.append("erratic path")
+                if direction:
+                    desc.append(direction)
+                desc.append(f"area: {grid}")
+                if obj.zone:
+                    desc.append(f"inside {obj.zone}")
+                if obj.loiter_seconds > 5:
+                    desc.append(f"loitering {obj.loiter_seconds:.0f}s")
+                if obj.theft_stage not in ("NONE", ""):
+                    desc.append(f"theft stage: {obj.theft_stage}")
+            else:
+                carrier = ""
+                if obj.close_to:
+                    persons_near = [n for n in obj.close_to if n.startswith("Person")]
+                    if persons_near:
+                        carrier = f" by {persons_near[0]}"
+
+                if was_static:
+                    desc.append(
+                        f"DISPLACED{carrier} — was stationary, now being moved"
+                    )
+                elif current_motion == "DISPLACED":
+                    desc.append(f"DISPLACED{carrier} — being moved")
+                else:
+                    desc.append(current_motion)
+
+                if direction:
+                    desc.append(direction)
+                desc.append(f"area: {grid}")
+                if obj.zone:
+                    desc.append(f"entered {obj.zone}")
+                if obj.erratic:
+                    desc.append("erratic movement")
+
+            lines.append(f"- {obj.class_name}#{obj.track_id}: {', '.join(desc)}")
+
+        if oldest:
+            for obj in objects:
+                if not self._is_static(obj):
+                    continue
+                prev = oldest.get("objects", {}).get(obj.track_id)
+                if prev and not prev["is_static"]:
+                    lines.append(
+                        f"- {obj.class_name}#{obj.track_id}: Stopped moving (now stationary)"
+                    )
+
+        return lines
+
+    def _build_proximity_section(self, objects: list[ObjectState]) -> list[str]:
+        active = [o for o in objects if not self._is_static(o)]
+        if len(active) < 2:
+            return []
+        lines: list[str] = []
+        seen_pairs: set[frozenset[str]] = set()
+        for obj in active:
+            for neighbor in obj.close_to:
+                pair = frozenset(
+                    [f"{obj.class_name}#{obj.track_id}", neighbor]
+                )
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    lines.append(
+                        f"- {obj.class_name}#{obj.track_id} is NEAR {neighbor}"
+                    )
+        return lines
+
+    def _build_alerts_section(self, objects: list[ObjectState]) -> list[str]:
+        alerts: list[str] = []
+        for obj in objects:
+            is_person = obj.class_id in self._person_class_ids
+
+            if not is_person and obj.speed >= 15:
+                alerts.append(
+                    f"- {obj.class_name}#{obj.track_id} is an item — "
+                    f"items cannot self-propel. Displacement indicates human interaction."
+                )
+
+            if self._is_weapon(obj):
+                alerts.append(
+                    f"- WEAPON DETECTED: {obj.class_name}#{obj.track_id}"
+                )
+
+            if obj.theft_stage == "BROWSING":
+                alerts.append(
+                    f"- Person#{obj.track_id}: Interacting with merchandise (BROWSING)"
+                )
+            elif obj.theft_stage == "CONCEALING":
+                alerts.append(
+                    f"- Person#{obj.track_id}: CONCEALMENT — "
+                    f"hand moved from item to body"
+                )
+            elif obj.theft_stage == "FLIGHT":
+                alerts.append(
+                    f"- Person#{obj.track_id}: FLIGHT — "
+                    f"moving away after concealing item. Theft confirmed."
+                )
+
+            if obj.loiter_seconds > 60:
+                alerts.append(
+                    f"- {obj.class_name}#{obj.track_id}: Extended loitering "
+                    f"in {obj.zone} for {obj.loiter_seconds:.0f}s"
+                )
+
+        return alerts
+
+    # -----------------------------------------------------------------
+    # Build final semantic scene text for the LLM
+    # -----------------------------------------------------------------
+
+    def _build_scene_text(self, objects: list[ObjectState]) -> str:
         if not objects:
             return "Scene empty."
 
-        static = [o for o in objects if self._is_static(o)]
-        active = [o for o in objects if not self._is_static(o)]
+        parts: list[str] = [self._build_scene_line(objects)]
 
-        parts: list[str] = []
-
-        # --- Events (disappearances, zone intrusions, kinematics) ---
         if self._event_log:
+            parts.append("")
             parts.append("EVENTS:")
             for evt in self._event_log:
                 parts.append(f"  - {evt}")
-            parts.append("")
             self._event_log.clear()
 
-        # --- Static inventory (single compressed line) ---
-        if static:
-            names = ", ".join(f"{o.class_name}#{o.track_id}" for o in static)
-            parts.append(f"STATIC INVENTORY: {names} (All Stationary)")
+        behavior = self._build_behavior_section(objects)
+        if behavior:
+            time_window = ""
+            if len(self._timeline) >= 2:
+                dt = self._timeline[-1]["timestamp"] - self._timeline[0]["timestamp"]
+                time_window = f" (last {dt:.1f}s)"
             parts.append("")
+            parts.append(f"BEHAVIOR{time_window}:")
+            parts.extend(behavior)
 
-        # --- Timeline (active objects only) ---
-        if len(self._timeline) > 1:
-            parts.append("TIMELINE:")
-            now = self._timeline[-1]["timestamp"]
-            for entry in list(self._timeline)[:-1]:
-                age = now - entry["timestamp"]
-                parts.append(f"  T-{age:.1f}s: {entry['summary']}")
+        proximity = self._build_proximity_section(objects)
+        if proximity:
             parts.append("")
+            parts.append("PROXIMITY:")
+            parts.extend(proximity)
 
-        # --- Current state (active objects only, with grid) ---
-        if active:
-            parts.append("CURRENT STATE:")
-            for obj in active:
-                cname = obj.class_name
-                if obj.speed < 5:
-                    motion = "Stationary"
-                elif obj.speed < self._running_speed:
-                    motion = f"Moving ({obj.speed:.0f}px/s)"
-                else:
-                    motion = f"FAST/Running ({obj.speed:.0f}px/s)"
-
-                cx = float(obj.center[0]) if obj.center is not None else 0.0
-                cy = float(obj.center[1]) if obj.center is not None else 0.0
-                grid = self._get_grid_position(cx, cy)
-
-                erratic_tag = ", Erratic" if obj.erratic else ""
-                zone_tag = f", Zone: {obj.zone}" if obj.zone else ""
-                loiter_tag = f", Loitering: {obj.loiter_seconds:.0f}s" if obj.loiter_seconds > 2 else ""
-                nearby = f" -> NEARBY: [{', '.join(obj.close_to)}]" if obj.close_to else ""
-                weapon_tag = " [WEAPON]" if self._is_weapon(obj) else ""
-
-                parts.append(
-                    f"  {cname}#{obj.track_id}: {motion}{erratic_tag}"
-                    f" [Grid: {grid}]{zone_tag}{loiter_tag}{weapon_tag}{nearby}"
-                )
-
-        if not static and not active:
-            parts.append("Scene empty.")
+        alerts = self._build_alerts_section(objects)
+        if alerts:
+            parts.append("")
+            parts.append("ALERTS:")
+            parts.extend(alerts)
 
         return "\n".join(parts)
 

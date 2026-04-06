@@ -223,7 +223,7 @@ class Yolo26Service:
                     job["finished_at"] = time()
                     break
                 pose_result = None
-                if pose_mode and pose_model is not None and self._should_run_pose(result):
+                if pose_mode and pose_model is not None and self._has_person(result):
                     frame_img = getattr(result, "orig_img", None)
                     if frame_img is not None:
                         pose_results = pose_model.predict(
@@ -244,10 +244,27 @@ class Yolo26Service:
     # RTMP job — manual cv2.VideoCapture loop with reconnection
     # ------------------------------------------------------------------
 
+    _RTMP_FFMPEG_OPTS = "fflags;nobuffer|flags;low_delay|analyzeduration;0|probesize;32"
+
+    def _open_rtmp_capture(self, url: str) -> cv2.VideoCapture:
+        """Open an RTMP stream with zero-latency FFmpeg options."""
+        saved_opts = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self._RTMP_FFMPEG_OPTS
+        try:
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        finally:
+            if saved_opts is not None:
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = saved_opts
+            elif "OPENCV_FFMPEG_CAPTURE_OPTIONS" in os.environ:
+                del os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"]
+        return cap
+
     def _run_rtmp_job(self, job_id: str, job: dict, source_url: str) -> None:
         import time as _time
         reconnects = 0
         cap: cv2.VideoCapture | None = None
+        frame_idx = 0
+        stride = max(int(config.YOLO_VID_STRIDE), 1)
 
         try:
             while not self._is_stopped(job):
@@ -264,12 +281,7 @@ class Yolo26Service:
                             break
                         _time.sleep(_RTMP_RECONNECT_DELAY)
 
-                    saved_opts = os.environ.pop("OPENCV_FFMPEG_CAPTURE_OPTIONS", None)
-                    try:
-                        cap = cv2.VideoCapture(source_url, cv2.CAP_FFMPEG)
-                    finally:
-                        if saved_opts is not None:
-                            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = saved_opts
+                    cap = self._open_rtmp_capture(source_url)
                     if not cap.isOpened():
                         cap.release()
                         cap = None
@@ -277,7 +289,10 @@ class Yolo26Service:
                         logger.warning("rtmp_open_failed url=%s", source_url)
                         continue
                     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    logger.info("rtmp_connected url=%s", source_url)
+                    logger.info(
+                        "rtmp_connected url=%s ffmpeg_opts=%s stride=%d",
+                        source_url, self._RTMP_FFMPEG_OPTS, stride,
+                    )
                     self._reset_tracker()
 
                 ret, frame = cap.read()
@@ -289,6 +304,10 @@ class Yolo26Service:
                     continue
 
                 reconnects = 0
+                frame_idx += 1
+                if stride > 1 and frame_idx % stride != 0:
+                    continue
+
                 model = self._get_model()
                 results = model.track(
                     source=frame,
@@ -301,7 +320,7 @@ class Yolo26Service:
                 )
                 if results:
                     pose_result = None
-                    if job.get("pose_theft_mode") and self._should_run_pose(results[0]):
+                    if job.get("pose_theft_mode") and self._has_person(results[0]):
                         pose_results = self._get_pose_model().predict(
                             frame, conf=0.5,
                             device=config.YOLO_DEVICE, verbose=False,
@@ -337,6 +356,17 @@ class Yolo26Service:
             return 0.0
         import numpy as _np
         return float(_np.hypot(max(0.0, ix1 - ix2), max(0.0, iy1 - iy2)))
+
+    @staticmethod
+    def _has_person(result) -> bool:
+        """Return True if the frame has at least one detected person."""
+        boxes = getattr(result, "boxes", None)
+        if boxes is None or boxes.xyxy is None:
+            return False
+        for b in boxes:
+            if int(b.cls.item()) if b.cls is not None else -1 == 0:
+                return True
+        return False
 
     @staticmethod
     def _should_run_pose(std_result) -> bool:
@@ -499,14 +529,15 @@ class Yolo26Service:
                             raw_buf.pop(0)
                 self._judge_zone_events(job)
 
+        job["event_id"] = int(job.get("event_id", 0)) + 1
+        job["last_event"] = {"batch": [event]}
+
         batch = job.get("batch")
         if isinstance(batch, list):
             batch.append(event)
         stream_every = max(int(config.YOLO_STREAM_EVERY), 1)
         if frame_index % stream_every == 0:
-            job["event_id"] = int(job.get("event_id", 0)) + 1
-            job["last_event"] = {"batch": list(batch or [])}
-            self._maybe_analyze(job)
+            self._maybe_analyze(job, list(batch or []))
             if isinstance(batch, list):
                 batch.clear()
             logger.info(
@@ -532,7 +563,7 @@ class Yolo26Service:
         if isinstance(batch, list) and batch:
             job["event_id"] = int(job.get("event_id", 0)) + 1
             job["last_event"] = {"batch": list(batch)}
-            self._maybe_analyze(job)
+            self._maybe_analyze(job, list(batch))
             batch.clear()
         logger.info(
             "yolo_job_done id=%s frames=%s detections=%s",
@@ -667,12 +698,16 @@ class Yolo26Service:
         scene_text = logic.get("scene_text", "")
         if "ALERT" in scene_text or "DISAPPEARED" in scene_text:
             return False
+        if "STATE_CHANGE" in scene_text or "POSE_KINEMATIC" in scene_text:
+            return False
         objects = logic.get("objects", [])
         if not objects:
             return True
         for obj in objects:
             if not isinstance(obj, dict):
                 continue
+            if obj.get("theft_stage", "NONE") not in ("NONE", ""):
+                return False
             if obj.get("speed", 0) >= self._CALM_SPEED:
                 return False
             if obj.get("erratic", False):
@@ -804,9 +839,15 @@ class Yolo26Service:
         sp = job.get("security_priorities") or {}
 
         base = (
-            "You are an AI CCTV analyst. Analyze the scene data and respond ONLY with valid JSON.\n"
-            "You MUST think step-by-step INSIDE the JSON before scoring. Use this exact schema:\n"
-            '{"chain_of_thought": "Briefly summarize object movements and disappearances between the frames", '
+            "You are an AI CCTV analyst. You receive pre-interpreted scene data:\n"
+            "- SCENE: Object inventory (counts, stationary/displaced status)\n"
+            "- EVENTS: Critical alerts — zone intrusions, disappearances, pose kinematics\n"
+            "- BEHAVIOR: What each object is doing — speed changes, direction, area.\n"
+            "  'DISPLACED' = an item is moving (items can't self-propel, a human moved it)\n"
+            "- PROXIMITY: Who is NEAR whom\n"
+            "- ALERTS: Pre-flagged suspicious patterns requiring your assessment\n\n"
+            "Respond ONLY with valid JSON. Think step-by-step INSIDE the JSON:\n"
+            '{"chain_of_thought": "Analyze behavior changes, displacement, and alerts", '
             '"risk_score": 0-100, "risk_level": "LOW"|"MEDIUM"|"HIGH", '
             '"label": "2-5 word title", "explanation": "1 short sentence concluding the risk"}\n\n'
         )
@@ -815,15 +856,19 @@ class Yolo26Service:
             base += (
                 "RULES:\n"
                 "  1) ADVANCED POSE THEFT MODE: The system tracks deterministic theft stages "
-                "(BROWSING -> CONCEALING -> FLIGHT). If the text reports "
-                "'STATE_CHANGE: Person#X entered FLIGHT stage', this is absolute "
-                "mathematical proof of theft. Flag as HIGH RISK THEFT immediately. "
-                "Provide a short explanation of the sequence.\n"
-                "  2) You are in THEFT-ONLY mode. Ignore violence, falls, fire, "
+                "(BROWSING -> CONCEALING -> FLIGHT) via skeleton keypoint analysis.\n"
+                "  2) STAGE RISK LEVELS:\n"
+                "     - BROWSING (wrist near item): LOW risk — informational, person interacting with merchandise.\n"
+                "     - CONCEALING (wrist moved from item to hip/torso): MEDIUM risk — possible concealment, "
+                "flag as 'Suspicious concealment' with risk_score 50-65.\n"
+                "     - FLIGHT (moving after concealment OR item disappeared): HIGH risk — "
+                "this is mathematical proof of theft. Flag as HIGH RISK THEFT immediately "
+                "with risk_score 85-100.\n"
+                "  3) You are in THEFT-ONLY mode. Ignore violence, falls, fire, "
                 "and all other non-theft events. If no theft stages are reported, "
                 "respond with LOW risk and a neutral label.\n\n"
-                "IMPORTANT: ONLY analyze POSE_KINEMATIC and STATE_CHANGE events. "
-                "Normal person movement is LOW risk. Only FLIGHT stage = HIGH risk."
+                "IMPORTANT: Analyze POSE_KINEMATIC and STATE_CHANGE events. "
+                "Normal person movement without stage transitions is LOW risk."
             )
             zone_instructions = job.get("zone_instructions")
             if zone_instructions and isinstance(zone_instructions, dict):
@@ -841,14 +886,11 @@ class Yolo26Service:
         rules = []
         if sp.get("theft_detection", False):
             rules.append(
-                "THEFT: If a Person overlaps an Item and the Item disappears "
-                "while the Person moves away, that is HIGH risk theft. "
-                "CRITICAL TEMPORAL ANALYSIS: You are receiving two recent frame batches. "
-                "Compare them. If a stealable object (bag, phone, laptop, etc.) appears "
-                "in the older frame but is missing in the newest frame, check the TIMELINE "
-                "to see if a Person was 'Nearby' or 'close_to' it right before it vanished. "
-                "If yes, and the person is now moving quickly or erratically, this is a "
-                "HIGH risk theft."
+                "THEFT: Focus on ALERTS for displaced items and BEHAVIOR for person movements. "
+                "If an item is DISPLACED and a person who was NEAR it is now moving away, "
+                "this is HIGH risk theft. Check EVENTS for DISAPPEARED alerts — "
+                "items vanishing while a person was nearby = theft. "
+                "A person with erratic movement near displaced items = HIGH risk."
             )
         else:
             rules.append(
@@ -1040,12 +1082,11 @@ class Yolo26Service:
     # Producer: prepare + enqueue (called from detection loop)
     # ------------------------------------------------------------------
 
-    def _maybe_analyze(self, job: dict[str, object]) -> None:
+    def _maybe_analyze(
+        self, job: dict[str, object], batch_frames: list | None = None,
+    ) -> None:
         """Prepare analysis payload and enqueue for the background LLM consumer."""
-        batch = job.get("last_event", {})
-        if not isinstance(batch, dict):
-            return
-        frames = batch.get("batch")
+        frames = batch_frames
         if not isinstance(frames, list) or not frames:
             return
         buffer = job.get("analysis_buffer")
@@ -1063,13 +1104,15 @@ class Yolo26Service:
             frame_idx = frame.get("frame_index", "?")
 
             if i < len(frames) - 1:
-                if "CURRENT STATE:" in scene_text:
-                    _, _, parsed_state = scene_text.partition("CURRENT STATE:")
-                    texts.append(f"Frame {frame_idx} CURRENT STATE:\n{parsed_state.strip()}")
+                for marker in ("\nEVENTS:", "\nBEHAVIOR", "\nPROXIMITY", "\nALERTS"):
+                    idx = scene_text.find(marker)
+                    if idx >= 0:
+                        texts.append(f"Frame {frame_idx}:{scene_text[idx:]}")
+                        break
                 else:
-                    texts.append(f"Frame {frame_idx} CURRENT STATE:\n{scene_text.strip()}")
+                    texts.append(f"Frame {frame_idx}:\n{scene_text.strip()}")
             else:
-                texts.append(f"Frame {frame_idx} FULL SUMMARY:\n{scene_text.strip()}")
+                texts.append(f"Frame {frame_idx} FULL:\n{scene_text.strip()}")
 
         if texts:
             buffer.append("\n\n".join(texts))
@@ -1083,7 +1126,7 @@ class Yolo26Service:
             }
             return
 
-        if len(buffer) < 2:
+        if not buffer:
             return
 
         combined = "\n\n".join(buffer[-2:])
