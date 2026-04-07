@@ -1354,8 +1354,6 @@ class Yolo26Service:
                 sb["last_capture"] = now
 
                 if len(sb["frames"]) == 1:
-                    # First frame — emit preliminary alert
-                    self._emit_preliminary_alert(job, suspect)
                     logger.info(
                         "supreme_buffer_started person=#%d items=%s frames=1/%d",
                         tid, suspect["item_labels"], needed,
@@ -1378,24 +1376,6 @@ class Yolo26Service:
                 self._enqueue_vlm_analysis(job, frames_to_send, context, tid)
 
         job["supreme_suspects"] = buffers
-
-    def _emit_preliminary_alert(self, job: dict, suspect: dict) -> None:
-        """Set a preliminary MEDIUM analysis while VLM is processing."""
-        items_str = ", ".join(suspect["item_labels"])
-        job["analysis"] = {
-            "risk_score": 40,
-            "risk_score_raw": 40,
-            "risk_level": "MEDIUM",
-            "label": "Suspicious interaction",
-            "explanation": (
-                f"Person #{suspect['track_id']} interacting with {items_str} "
-                f"— visual analysis in progress."
-            ),
-            "theft_detected": False,
-            "confidence_score": 40,
-            "mode": "supreme",
-        }
-        job["supreme_vlm_pending"] = True
 
     def _enqueue_vlm_analysis(
         self,
