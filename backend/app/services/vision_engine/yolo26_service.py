@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -10,11 +11,13 @@ from time import time
 
 import cv2
 import httpx
+import numpy as np
 from ultralytics import YOLO
 from yt_dlp import YoutubeDL
 
 from app.core import config
 from app.services.vision_engine.logic_engine import AdvancedLogicEngine
+from app.services.vlm_engine.pixtral_client import PixtralClient
 
 _RTMP_RECONNECT_DELAY = 2.0
 _RTMP_MAX_RECONNECTS = 10
@@ -49,6 +52,13 @@ class Yolo26Service:
         self._analysis_worker: Thread | None = None
         self._worker_lock = Lock()
 
+        # Supreme OLEYES — Pixtral VLM pipeline
+        self._vlm_client: PixtralClient | None = None
+        self._vlm_client_lock = Lock()
+        self._vlm_queue: queue.Queue = queue.Queue(maxsize=2)
+        self._vlm_worker: Thread | None = None
+        self._vlm_worker_lock = Lock()
+
     def _get_model(self) -> YOLO:
         if self._model is not None:
             return self._model
@@ -79,6 +89,7 @@ class Yolo26Service:
                 count += 1
                 logger.info("auto_stopped job=%s (new job incoming)", jid)
         self._shutdown_analysis_worker()
+        self._shutdown_vlm_worker()
         return count
 
     def _reset_tracker(self) -> None:
@@ -107,9 +118,14 @@ class Yolo26Service:
         zone_instructions: dict[str, str] | None = None,
         security_priorities: dict[str, bool] | None = None,
         pose_theft_mode: bool = False,
+        supreme_mode: bool = False,
     ) -> None:
         self.stop_all_running()
         self._reset_tracker()
+
+        # Supreme mode takes priority over pose theft mode
+        if supreme_mode:
+            pose_theft_mode = False
 
         self._logic.reset()
         if zones:
@@ -122,10 +138,10 @@ class Yolo26Service:
         theft_on = sp.get("theft_detection", True)
         self._logic.theft_detection_enabled = theft_on
         self._logic.pose_theft_mode = pose_theft_mode
-        logger.info("security_priorities theft=%s fire=%s fall=%s violence=%s analytics=%s pose_theft=%s",
+        logger.info("security_priorities theft=%s fire=%s fall=%s violence=%s analytics=%s pose_theft=%s supreme=%s",
                      theft_on, sp.get("fire_detection"), sp.get("person_fall_detection"),
                      sp.get("violence_detection"), sp.get("customer_behavior_analytics"),
-                     pose_theft_mode)
+                     pose_theft_mode, supreme_mode)
 
         self._jobs[job_id] = {
             "status": "queued",
@@ -133,6 +149,7 @@ class Yolo26Service:
             "scene_context": scene_context,
             "stream_protocol": stream_protocol,
             "pose_theft_mode": pose_theft_mode,
+            "supreme_mode": supreme_mode,
             "zones": zones or {},
             "zone_instructions": zone_instructions or {},
             "security_priorities": sp,
@@ -152,8 +169,18 @@ class Yolo26Service:
             "raw_zone_events": [],
             "risk_scores": deque(maxlen=5),
             "stop_event": Event(),
+            # Supreme OLEYES buffer state
+            "supreme_buffer": [],
+            "supreme_buffering": False,
+            "supreme_trigger_time": 0.0,
+            "supreme_last_call": 0.0,
+            "supreme_last_capture": 0.0,
+            "supreme_trigger_box": None,
         }
-        self._ensure_analysis_worker()
+        if supreme_mode:
+            self._ensure_vlm_worker()
+        else:
+            self._ensure_analysis_worker()
         if scene_context:
             logger.info("Job queued id=%s proto=%s scene_context=\"%s\"", job_id, stream_protocol, scene_context)
         else:
@@ -532,19 +559,23 @@ class Yolo26Service:
         job["event_id"] = int(job.get("event_id", 0)) + 1
         job["last_event"] = {"batch": [event]}
 
-        batch = job.get("batch")
-        if isinstance(batch, list):
-            batch.append(event)
-        stream_every = max(int(config.YOLO_STREAM_EVERY), 1)
-        if frame_index % stream_every == 0:
-            self._maybe_analyze(job, list(batch or []))
+        if job.get("supreme_mode"):
+            # Supreme OLEYES: skip LLM text pipeline, run VLM frame buffer
+            self._supreme_buffer_step(job, result, detections)
+        else:
+            batch = job.get("batch")
             if isinstance(batch, list):
-                batch.clear()
-            logger.info(
-                "frame=%s  detections=%d  batch_sent",
-                frame_index,
-                len(detections),
-            )
+                batch.append(event)
+            stream_every = max(int(config.YOLO_STREAM_EVERY), 1)
+            if frame_index % stream_every == 0:
+                self._maybe_analyze(job, list(batch or []))
+                if isinstance(batch, list):
+                    batch.clear()
+                logger.info(
+                    "frame=%s  detections=%d  batch_sent",
+                    frame_index,
+                    len(detections),
+                )
         log_every = max(int(config.YOLO_LOG_EVERY), 1)
         if frame_index % log_every == 0:
             logger.debug("yolo_frame=%s vectors=%s", frame_index, detections)
@@ -1144,3 +1175,240 @@ class Yolo26Service:
                 self._analysis_queue.put_nowait((job, combined, system_prompt))
             except queue.Full:
                 pass
+
+    # ------------------------------------------------------------------
+    # Supreme OLEYES — Pixtral VLM temporal frame buffer pipeline
+    # ------------------------------------------------------------------
+
+    _SUPREME_CROP_PAD = 40  # extra pixels around the union bbox
+
+    def _get_vlm_client(self) -> PixtralClient:
+        if self._vlm_client is not None:
+            return self._vlm_client
+        with self._vlm_client_lock:
+            if self._vlm_client is None:
+                self._vlm_client = PixtralClient()
+                logger.info("pixtral_vlm_client_initialized")
+        return self._vlm_client
+
+    @staticmethod
+    def _crop_and_encode(frame: np.ndarray, boxes: list[list[float]], pad: int = 40) -> str:
+        """Compute a union bounding box from *boxes*, crop *frame*, JPEG-encode, and return Base64."""
+        h, w = frame.shape[:2]
+        x1 = max(int(min(b[0] for b in boxes)) - pad, 0)
+        y1 = max(int(min(b[1] for b in boxes)) - pad, 0)
+        x2 = min(int(max(b[2] for b in boxes)) + pad, w)
+        y2 = min(int(max(b[3] for b in boxes)) + pad, h)
+        cropped = frame[y1:y2, x1:x2]
+        _, buf = cv2.imencode(".jpg", cropped, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return base64.b64encode(buf).decode("utf-8")
+
+    def _supreme_trigger_check(self, detections: list) -> list[list[float]] | None:
+        """Return the union bbox list (person + nearby items) if a person is near
+        a stealable object, else None."""
+        person_rects: list[list[float]] = []
+        item_rects: list[list[float]] = []
+        for det in detections:
+            cls_id = int(det[0])
+            xyxy = det[2:6]
+            if cls_id == 0:
+                person_rects.append(xyxy)
+            elif cls_id in self._STEALABLE_CLS:
+                item_rects.append(xyxy)
+
+        if not person_rects:
+            return None
+
+        # If there are stealable items nearby, include them in the crop
+        relevant: list[list[float]] = []
+        for pr in person_rects:
+            near_item = False
+            for ir in item_rects:
+                if self._dist_rects(pr, ir) < self._POSE_GATE_PX:
+                    relevant.append(ir)
+                    near_item = True
+            if near_item:
+                relevant.append(pr)
+
+        # If no person-item interaction, just crop any person in the scene
+        if not relevant:
+            relevant = person_rects
+
+        return relevant if relevant else None
+
+    def _supreme_buffer_step(self, job: dict, result, detections: list) -> None:
+        """Manage the 3-frame sliding window buffer for the Pixtral VLM pipeline.
+
+        Called every frame when supreme_mode is active. The logic:
+        1. If not buffering, check if a person is in the scene -> start buffering
+        2. If buffering, capture frames at SUPREME_FRAME_INTERVAL spacing
+        3. When SUPREME_FRAME_COUNT frames collected, enqueue VLM analysis
+        """
+        now = time()
+        frame_img = getattr(result, "orig_img", None)
+        if frame_img is None:
+            return
+
+        cooldown = config.SUPREME_COOLDOWN
+        if now - float(job.get("supreme_last_call", 0)) < cooldown:
+            return
+
+        buf: list = job.get("supreme_buffer", [])
+        buffering: bool = bool(job.get("supreme_buffering", False))
+        interval = config.SUPREME_FRAME_INTERVAL
+        needed = config.SUPREME_FRAME_COUNT
+
+        if not buffering:
+            # Check trigger: person detected in frame
+            union_boxes = self._supreme_trigger_check(detections)
+            if union_boxes is None:
+                return
+
+            # Start buffering — capture first frame
+            try:
+                b64 = self._crop_and_encode(frame_img, union_boxes, self._SUPREME_CROP_PAD)
+            except Exception as exc:
+                logger.warning("supreme_crop_failed: %s", exc)
+                return
+            buf.clear()
+            buf.append(b64)
+            job["supreme_buffer"] = buf
+            job["supreme_buffering"] = True
+            job["supreme_trigger_time"] = now
+            job["supreme_last_capture"] = now
+            job["supreme_trigger_box"] = union_boxes
+            logger.info("supreme_buffer_started frames=1/%d", needed)
+            return
+
+        # Currently buffering — check if it's time for the next capture
+        last_capture = float(job.get("supreme_last_capture", 0))
+        if now - last_capture < interval:
+            return
+
+        trigger_box = job.get("supreme_trigger_box")
+        if not trigger_box:
+            # Recalculate from current detections
+            trigger_box = self._supreme_trigger_check(detections)
+            if not trigger_box:
+                # Person left the scene during buffering — reset
+                buf.clear()
+                job["supreme_buffering"] = False
+                logger.info("supreme_buffer_reset (subject left)")
+                return
+
+        try:
+            b64 = self._crop_and_encode(frame_img, trigger_box, self._SUPREME_CROP_PAD)
+        except Exception as exc:
+            logger.warning("supreme_crop_failed: %s", exc)
+            return
+
+        buf.append(b64)
+        job["supreme_last_capture"] = now
+        logger.info("supreme_buffer_captured frames=%d/%d", len(buf), needed)
+
+        if len(buf) >= needed:
+            # Buffer full — enqueue the VLM analysis
+            frames_to_send = list(buf[:needed])
+            buf.clear()
+            job["supreme_buffering"] = False
+            job["supreme_last_call"] = now
+            logger.info("supreme_buffer_complete — enqueueing VLM analysis")
+            self._enqueue_vlm_analysis(job, frames_to_send)
+
+    def _enqueue_vlm_analysis(self, job: dict, base64_frames: list[str]) -> None:
+        try:
+            self._vlm_queue.put_nowait((job, base64_frames))
+        except queue.Full:
+            try:
+                self._vlm_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._vlm_queue.put_nowait((job, base64_frames))
+            except queue.Full:
+                logger.warning("supreme_vlm_queue_full — dropping analysis")
+
+    # ------------------------------------------------------------------
+    # VLM consumer thread (mirrors _analysis_consumer pattern)
+    # ------------------------------------------------------------------
+
+    def _ensure_vlm_worker(self) -> None:
+        with self._vlm_worker_lock:
+            if self._vlm_worker is None or not self._vlm_worker.is_alive():
+                self._vlm_worker = Thread(
+                    target=self._vlm_consumer,
+                    daemon=True,
+                    name="vlm-consumer",
+                )
+                self._vlm_worker.start()
+                logger.info("vlm_worker_started")
+
+    def _shutdown_vlm_worker(self) -> None:
+        while not self._vlm_queue.empty():
+            try:
+                self._vlm_queue.get_nowait()
+            except queue.Empty:
+                break
+        with self._vlm_worker_lock:
+            if self._vlm_worker is not None and self._vlm_worker.is_alive():
+                self._vlm_queue.put(self._SENTINEL)
+                self._vlm_worker.join(timeout=60)
+                logger.info("vlm_worker_joined")
+            self._vlm_worker = None
+
+    def _vlm_consumer(self) -> None:
+        """Background thread: pull VLM tasks from the queue and call Pixtral."""
+        while True:
+            item = self._vlm_queue.get()
+            if item is self._SENTINEL:
+                break
+            job, base64_frames = item
+            try:
+                self._run_vlm_analysis(job, base64_frames)
+            except Exception as exc:
+                logger.warning("vlm_consumer unhandled: %s", exc)
+
+    def _run_vlm_analysis(self, job: dict, base64_frames: list[str]) -> None:
+        """Execute the Pixtral VLM call and map result to the analysis dict."""
+        fallback = {
+            "risk_score": 0,
+            "risk_score_raw": 0,
+            "risk_level": "LOW",
+            "label": "VLM analysis pending",
+            "explanation": "Visual analysis could not be completed.",
+            "theft_detected": False,
+            "confidence_score": 0,
+            "mode": "supreme",
+        }
+        try:
+            client = self._get_vlm_client()
+            result = client.analyze_frames(base64_frames)
+
+            theft = result.get("theft_detected", False)
+            score = int(result.get("confidence_score", 0))
+            analysis_text = result.get("analysis", "")
+
+            if theft:
+                risk_level = "HIGH"
+            elif score >= 50:
+                risk_level = "MEDIUM"
+            else:
+                risk_level = "LOW"
+
+            job["analysis"] = {
+                "risk_score": score,
+                "risk_score_raw": score,
+                "risk_level": risk_level,
+                "label": "Theft Detected" if theft else "Normal Activity",
+                "explanation": analysis_text,
+                "theft_detected": theft,
+                "confidence_score": score,
+                "mode": "supreme",
+            }
+            logger.info(
+                "supreme_vlm_result theft=%s score=%d level=%s analysis=%s",
+                theft, score, risk_level, analysis_text[:100],
+            )
+        except Exception as exc:
+            logger.warning("supreme_vlm_failed: %s", exc)
+            job["analysis"] = fallback

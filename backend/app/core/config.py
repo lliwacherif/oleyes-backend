@@ -39,6 +39,14 @@ SCALWAY_ANALYSIS_PRESENCE_PENALTY = float(
     get_env("SCALWAY_ANALYSIS_PRESENCE_PENALTY", "0.0")
 )
 
+# ── Supreme OLEYES (Pixtral VLM) ─────────────────────────────────
+SCALWAY_VLM_MODEL = get_env("SCALWAY_VLM_MODEL", "pixtral-12b-2409")
+SUPREME_FRAME_COUNT = int(get_env("SUPREME_FRAME_COUNT", "3"))
+SUPREME_FRAME_INTERVAL = float(get_env("SUPREME_FRAME_INTERVAL", "1.0"))
+SUPREME_VLM_MAX_TOKENS = int(get_env("SUPREME_VLM_MAX_TOKENS", "500"))
+SUPREME_VLM_TEMPERATURE = float(get_env("SUPREME_VLM_TEMPERATURE", "0.2"))
+SUPREME_COOLDOWN = float(get_env("SUPREME_COOLDOWN", "10.0"))
+
 YOLO_MODEL = get_env("YOLO_MODEL", "yolo26n.pt")
 YOLO_POSE_MODEL = get_env("YOLO_POSE_MODEL", "yolo26n-pose.pt")
 YOLO_DEVICE = get_env("YOLO_DEVICE", "cpu")
