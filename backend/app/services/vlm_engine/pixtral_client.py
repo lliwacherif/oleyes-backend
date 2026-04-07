@@ -12,10 +12,11 @@ logger = logging.getLogger(__name__)
 
 SUPREME_SYSTEM_PROMPT = (
     "You are a top-tier retail security analyst for OLEYES. "
-    "You will be provided with a sequence of 3 chronological images showing a person "
-    "interacting with an item. Analyze the temporal sequence to determine if shoplifting "
-    "or theft is occurring. Look for items being concealed, erratic movements, or "
-    "suspicious departure.\n\n"
+    "You will be provided with a sequence of chronological images showing a person "
+    "interacting with an item, along with YOLO object-detection context describing "
+    "what was detected in the scene. Analyze the temporal sequence to determine if "
+    "shoplifting or theft is occurring. Look for items being concealed, erratic "
+    "movements, or suspicious departure.\n\n"
     "You MUST respond ONLY with a valid JSON object in this exact format:\n"
     '{\n'
     '  "analysis": "A brief 1-sentence explanation of the sequence.",\n'
@@ -24,9 +25,10 @@ SUPREME_SYSTEM_PROMPT = (
     '}'
 )
 
-SUPREME_USER_PROMPT = (
-    "Analyze this 3-frame chronological sequence of a user interacting with an item. "
-    "Based on the visual evidence, is a theft occurring? Return the requested JSON."
+_BASE_USER_PROMPT = (
+    "Analyze this chronological frame sequence of a person interacting with an item. "
+    "Based on the visual evidence and the YOLO context below, is a theft occurring? "
+    "Return the requested JSON."
 )
 
 
@@ -45,12 +47,29 @@ class PixtralClient:
             api_key=config.SCALWAY_API_KEY,
         )
 
-    def analyze_frames(self, base64_frames: list[str]) -> dict:
-        """Send multiple Base64-encoded JPEG frames to Pixtral for analysis.
+    def warm_up(self) -> None:
+        """Force the underlying HTTP connection pool to open so the first
+        real call doesn't pay the TLS-handshake cost."""
+        try:
+            self._client.models.list()
+            logger.info("pixtral_connection_warmed")
+        except Exception:
+            logger.debug("pixtral_warmup_noop (non-critical)")
+
+    def analyze_frames(
+        self,
+        base64_frames: list[str],
+        yolo_context: str = "",
+    ) -> dict:
+        """Send Base64-encoded JPEG frames + YOLO context to Pixtral.
 
         Returns a dict with keys: analysis, theft_detected, confidence_score.
         """
-        content: list[dict] = [{"type": "text", "text": SUPREME_USER_PROMPT}]
+        prompt_text = _BASE_USER_PROMPT
+        if yolo_context:
+            prompt_text += f"\n\nYOLO DETECTION CONTEXT:\n{yolo_context}"
+
+        content: list[dict] = [{"type": "text", "text": prompt_text}]
         for frame_b64 in base64_frames:
             content.append({
                 "type": "image_url",
@@ -99,7 +118,6 @@ class PixtralClient:
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        # Brute-force: find first balanced { ... }
         depth = 0
         start = -1
         for i, ch in enumerate(raw):

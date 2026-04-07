@@ -169,13 +169,10 @@ class Yolo26Service:
             "raw_zone_events": [],
             "risk_scores": deque(maxlen=5),
             "stop_event": Event(),
-            # Supreme OLEYES buffer state
-            "supreme_buffer": [],
-            "supreme_buffering": False,
-            "supreme_trigger_time": 0.0,
-            "supreme_last_call": 0.0,
-            "supreme_last_capture": 0.0,
-            "supreme_trigger_box": None,
+            # Supreme OLEYES — per-person tracking buffers
+            # {track_id: {"frames": [b64], "last_capture": float, "last_call": float, "items": [str]}}
+            "supreme_suspects": {},
+            "supreme_vlm_pending": False,
         }
         if supreme_mode:
             self._ensure_vlm_worker()
@@ -1177,10 +1174,19 @@ class Yolo26Service:
                 pass
 
     # ------------------------------------------------------------------
-    # Supreme OLEYES — Pixtral VLM temporal frame buffer pipeline
+    # Supreme OLEYES — Enhanced Pixtral VLM pipeline
+    #   - Per-person buffers tracked by ByteTrack ID
+    #   - Selective trigger (person + stealable item only)
+    #   - Dynamic crop recomputation per frame
+    #   - Resize to max 512px, JPEG quality 70
+    #   - Hybrid prompt with YOLO context
+    #   - Preliminary alert while VLM processes
+    #   - Pre-warmed VLM client connection
     # ------------------------------------------------------------------
 
-    _SUPREME_CROP_PAD = 40  # extra pixels around the union bbox
+    _SUPREME_CROP_PAD = 40
+    _SUPREME_JPEG_QUALITY = 70
+    _SUPREME_MIN_CROP = 80  # skip VLM if crop is smaller than this
 
     def _get_vlm_client(self) -> PixtralClient:
         if self._vlm_client is not None:
@@ -1192,56 +1198,109 @@ class Yolo26Service:
         return self._vlm_client
 
     @staticmethod
-    def _crop_and_encode(frame: np.ndarray, boxes: list[list[float]], pad: int = 40) -> str:
-        """Compute a union bounding box from *boxes*, crop *frame*, JPEG-encode, and return Base64."""
+    def _crop_and_encode(
+        frame: np.ndarray,
+        boxes: list[list[float]],
+        pad: int = 40,
+        max_dim: int = 512,
+        jpeg_quality: int = 70,
+    ) -> str | None:
+        """Crop union bbox, resize to *max_dim*, JPEG-encode, return Base64.
+
+        Returns None if the crop is too small to be useful.
+        """
         h, w = frame.shape[:2]
         x1 = max(int(min(b[0] for b in boxes)) - pad, 0)
         y1 = max(int(min(b[1] for b in boxes)) - pad, 0)
         x2 = min(int(max(b[2] for b in boxes)) + pad, w)
         y2 = min(int(max(b[3] for b in boxes)) + pad, h)
+        cw, ch = x2 - x1, y2 - y1
+        if cw < Yolo26Service._SUPREME_MIN_CROP or ch < Yolo26Service._SUPREME_MIN_CROP:
+            return None
         cropped = frame[y1:y2, x1:x2]
-        _, buf = cv2.imencode(".jpg", cropped, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        longest = max(cw, ch)
+        if longest > max_dim:
+            scale = max_dim / longest
+            cropped = cv2.resize(
+                cropped,
+                (int(cw * scale), int(ch * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+        _, buf = cv2.imencode(".jpg", cropped, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
         return base64.b64encode(buf).decode("utf-8")
 
-    def _supreme_trigger_check(self, detections: list) -> list[list[float]] | None:
-        """Return the union bbox list (person + nearby items) if a person is near
-        a stealable object, else None."""
-        person_rects: list[list[float]] = []
-        item_rects: list[list[float]] = []
+    def _supreme_find_suspects(
+        self, detections: list,
+    ) -> list[dict]:
+        """Identify persons near stealable items. Returns per-person info.
+
+        Each entry: {"track_id": int, "person_box": [x1,y1,x2,y2],
+                     "crop_boxes": [[x1,y1,x2,y2], ...], "item_labels": ["Handbag#7"]}
+        Only returns persons that are within proximity of a stealable item.
+        """
+        from app.services.vision_engine.logic_engine import COCO_NAMES
+
+        persons: list[dict] = []
+        items: list[dict] = []
         for det in detections:
             cls_id = int(det[0])
             xyxy = det[2:6]
+            track_id = int(det[6]) if len(det) >= 7 and det[6] is not None else -1
+            name = COCO_NAMES.get(cls_id, f"Object-{cls_id}")
             if cls_id == 0:
-                person_rects.append(xyxy)
+                persons.append({"track_id": track_id, "box": xyxy, "name": name})
             elif cls_id in self._STEALABLE_CLS:
-                item_rects.append(xyxy)
+                items.append({"track_id": track_id, "box": xyxy, "name": name})
 
-        if not person_rects:
-            return None
+        if not persons or not items:
+            return []
 
-        # If there are stealable items nearby, include them in the crop
-        relevant: list[list[float]] = []
-        for pr in person_rects:
-            near_item = False
-            for ir in item_rects:
-                if self._dist_rects(pr, ir) < self._POSE_GATE_PX:
-                    relevant.append(ir)
-                    near_item = True
-            if near_item:
-                relevant.append(pr)
+        suspects: list[dict] = []
+        for p in persons:
+            if p["track_id"] == -1:
+                continue
+            near_items: list[dict] = []
+            for it in items:
+                if self._dist_rects(p["box"], it["box"]) < self._POSE_GATE_PX:
+                    near_items.append(it)
+            if near_items:
+                crop_boxes = [p["box"]] + [it["box"] for it in near_items]
+                item_labels = [
+                    f"{it['name']}#{it['track_id']}" for it in near_items
+                ]
+                suspects.append({
+                    "track_id": p["track_id"],
+                    "person_box": p["box"],
+                    "crop_boxes": crop_boxes,
+                    "item_labels": item_labels,
+                })
+        return suspects
 
-        # If no person-item interaction, just crop any person in the scene
-        if not relevant:
-            relevant = person_rects
+    def _supreme_build_context(self, job: dict, suspect: dict) -> str:
+        """Build a YOLO context string for the hybrid VLM prompt."""
+        tid = suspect["track_id"]
+        items_str = ", ".join(suspect["item_labels"])
+        lines = [f"Person #{tid} detected near {items_str}."]
 
-        return relevant if relevant else None
+        logic = job.get("logic")
+        if isinstance(logic, dict):
+            scene_text = logic.get("scene_text", "")
+            if "DISAPPEARED" in scene_text:
+                for line in scene_text.split("\n"):
+                    if "DISAPPEARED" in line:
+                        lines.append(line.strip().lstrip("- "))
+            if "DISPLACED" in scene_text:
+                for line in scene_text.split("\n"):
+                    if "DISPLACED" in line and f"#{tid}" in line:
+                        lines.append(line.strip().lstrip("- "))
+        return "\n".join(lines)
 
     def _supreme_buffer_step(self, job: dict, result, detections: list) -> None:
-        """Manage the 3-frame sliding window buffer for the Pixtral VLM pipeline.
+        """Per-person sliding window buffer for the Pixtral VLM pipeline.
 
-        Called every frame when supreme_mode is active. The logic:
-        1. If not buffering, check if a person is in the scene -> start buffering
-        2. If buffering, capture frames at SUPREME_FRAME_INTERVAL spacing
+        For each person near a stealable item:
+        1. Start a per-person buffer (first frame encoded immediately)
+        2. Capture subsequent frames at SUPREME_FRAME_INTERVAL with fresh crops
         3. When SUPREME_FRAME_COUNT frames collected, enqueue VLM analysis
         """
         now = time()
@@ -1249,82 +1308,111 @@ class Yolo26Service:
         if frame_img is None:
             return
 
-        cooldown = config.SUPREME_COOLDOWN
-        if now - float(job.get("supreme_last_call", 0)) < cooldown:
-            return
+        suspects = self._supreme_find_suspects(detections)
+        suspect_ids = {s["track_id"] for s in suspects}
 
-        buf: list = job.get("supreme_buffer", [])
-        buffering: bool = bool(job.get("supreme_buffering", False))
+        buffers: dict = job.get("supreme_suspects", {})
         interval = config.SUPREME_FRAME_INTERVAL
         needed = config.SUPREME_FRAME_COUNT
+        cooldown = config.SUPREME_COOLDOWN
+        max_dim = config.SUPREME_CROP_MAX_DIM
 
-        if not buffering:
-            # Check trigger: person detected in frame
-            union_boxes = self._supreme_trigger_check(detections)
-            if union_boxes is None:
-                return
+        # Prune buffers for persons no longer in the scene
+        for tid in list(buffers.keys()):
+            if tid not in suspect_ids:
+                del buffers[tid]
 
-            # Start buffering — capture first frame
-            try:
-                b64 = self._crop_and_encode(frame_img, union_boxes, self._SUPREME_CROP_PAD)
-            except Exception as exc:
-                logger.warning("supreme_crop_failed: %s", exc)
-                return
-            buf.clear()
-            buf.append(b64)
-            job["supreme_buffer"] = buf
-            job["supreme_buffering"] = True
-            job["supreme_trigger_time"] = now
-            job["supreme_last_capture"] = now
-            job["supreme_trigger_box"] = union_boxes
-            logger.info("supreme_buffer_started frames=1/%d", needed)
-            return
+        for suspect in suspects:
+            tid = suspect["track_id"]
 
-        # Currently buffering — check if it's time for the next capture
-        last_capture = float(job.get("supreme_last_capture", 0))
-        if now - last_capture < interval:
-            return
+            if tid not in buffers:
+                buffers[tid] = {
+                    "frames": [],
+                    "last_capture": 0.0,
+                    "last_call": 0.0,
+                    "items": suspect["item_labels"],
+                }
 
-        trigger_box = job.get("supreme_trigger_box")
-        if not trigger_box:
-            # Recalculate from current detections
-            trigger_box = self._supreme_trigger_check(detections)
-            if not trigger_box:
-                # Person left the scene during buffering — reset
-                buf.clear()
-                job["supreme_buffering"] = False
-                logger.info("supreme_buffer_reset (subject left)")
-                return
+            sb = buffers[tid]
+            sb["items"] = suspect["item_labels"]
 
+            if now - sb["last_call"] < cooldown:
+                continue
+
+            # Encode from fresh detections on every capture (dynamic crop)
+            if not sb["frames"] or (now - sb["last_capture"]) >= interval:
+                b64 = self._crop_and_encode(
+                    frame_img,
+                    suspect["crop_boxes"],
+                    self._SUPREME_CROP_PAD,
+                    max_dim,
+                    self._SUPREME_JPEG_QUALITY,
+                )
+                if b64 is None:
+                    continue
+                sb["frames"].append(b64)
+                sb["last_capture"] = now
+
+                if len(sb["frames"]) == 1:
+                    # First frame — emit preliminary alert
+                    self._emit_preliminary_alert(job, suspect)
+                    logger.info(
+                        "supreme_buffer_started person=#%d items=%s frames=1/%d",
+                        tid, suspect["item_labels"], needed,
+                    )
+                else:
+                    logger.info(
+                        "supreme_buffer_captured person=#%d frames=%d/%d",
+                        tid, len(sb["frames"]), needed,
+                    )
+
+            if len(sb["frames"]) >= needed:
+                frames_to_send = list(sb["frames"][:needed])
+                context = self._supreme_build_context(job, suspect)
+                sb["frames"].clear()
+                sb["last_call"] = now
+                logger.info(
+                    "supreme_buffer_complete person=#%d — enqueueing VLM",
+                    tid,
+                )
+                self._enqueue_vlm_analysis(job, frames_to_send, context, tid)
+
+        job["supreme_suspects"] = buffers
+
+    def _emit_preliminary_alert(self, job: dict, suspect: dict) -> None:
+        """Set a preliminary MEDIUM analysis while VLM is processing."""
+        items_str = ", ".join(suspect["item_labels"])
+        job["analysis"] = {
+            "risk_score": 40,
+            "risk_score_raw": 40,
+            "risk_level": "MEDIUM",
+            "label": "Suspicious interaction",
+            "explanation": (
+                f"Person #{suspect['track_id']} interacting with {items_str} "
+                f"— visual analysis in progress."
+            ),
+            "theft_detected": False,
+            "confidence_score": 40,
+            "mode": "supreme",
+        }
+        job["supreme_vlm_pending"] = True
+
+    def _enqueue_vlm_analysis(
+        self,
+        job: dict,
+        base64_frames: list[str],
+        yolo_context: str = "",
+        track_id: int = -1,
+    ) -> None:
         try:
-            b64 = self._crop_and_encode(frame_img, trigger_box, self._SUPREME_CROP_PAD)
-        except Exception as exc:
-            logger.warning("supreme_crop_failed: %s", exc)
-            return
-
-        buf.append(b64)
-        job["supreme_last_capture"] = now
-        logger.info("supreme_buffer_captured frames=%d/%d", len(buf), needed)
-
-        if len(buf) >= needed:
-            # Buffer full — enqueue the VLM analysis
-            frames_to_send = list(buf[:needed])
-            buf.clear()
-            job["supreme_buffering"] = False
-            job["supreme_last_call"] = now
-            logger.info("supreme_buffer_complete — enqueueing VLM analysis")
-            self._enqueue_vlm_analysis(job, frames_to_send)
-
-    def _enqueue_vlm_analysis(self, job: dict, base64_frames: list[str]) -> None:
-        try:
-            self._vlm_queue.put_nowait((job, base64_frames))
+            self._vlm_queue.put_nowait((job, base64_frames, yolo_context, track_id))
         except queue.Full:
             try:
                 self._vlm_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._vlm_queue.put_nowait((job, base64_frames))
+                self._vlm_queue.put_nowait((job, base64_frames, yolo_context, track_id))
             except queue.Full:
                 logger.warning("supreme_vlm_queue_full — dropping analysis")
 
@@ -1357,18 +1445,26 @@ class Yolo26Service:
             self._vlm_worker = None
 
     def _vlm_consumer(self) -> None:
-        """Background thread: pull VLM tasks from the queue and call Pixtral."""
+        """Background thread: pre-warm connection, then pull VLM tasks."""
+        client = self._get_vlm_client()
+        client.warm_up()
         while True:
             item = self._vlm_queue.get()
             if item is self._SENTINEL:
                 break
-            job, base64_frames = item
+            job, base64_frames, yolo_context, track_id = item
             try:
-                self._run_vlm_analysis(job, base64_frames)
+                self._run_vlm_analysis(job, base64_frames, yolo_context, track_id)
             except Exception as exc:
                 logger.warning("vlm_consumer unhandled: %s", exc)
 
-    def _run_vlm_analysis(self, job: dict, base64_frames: list[str]) -> None:
+    def _run_vlm_analysis(
+        self,
+        job: dict,
+        base64_frames: list[str],
+        yolo_context: str = "",
+        track_id: int = -1,
+    ) -> None:
         """Execute the Pixtral VLM call and map result to the analysis dict."""
         fallback = {
             "risk_score": 0,
@@ -1382,7 +1478,7 @@ class Yolo26Service:
         }
         try:
             client = self._get_vlm_client()
-            result = client.analyze_frames(base64_frames)
+            result = client.analyze_frames(base64_frames, yolo_context=yolo_context)
 
             theft = result.get("theft_detected", False)
             score = int(result.get("confidence_score", 0))
@@ -1395,20 +1491,27 @@ class Yolo26Service:
             else:
                 risk_level = "LOW"
 
+            label = "Normal Activity"
+            if theft:
+                label = f"Theft Detected (Person #{track_id})" if track_id >= 0 else "Theft Detected"
+
             job["analysis"] = {
                 "risk_score": score,
                 "risk_score_raw": score,
                 "risk_level": risk_level,
-                "label": "Theft Detected" if theft else "Normal Activity",
+                "label": label,
                 "explanation": analysis_text,
                 "theft_detected": theft,
                 "confidence_score": score,
                 "mode": "supreme",
+                "suspect_track_id": track_id,
             }
+            job["supreme_vlm_pending"] = False
             logger.info(
-                "supreme_vlm_result theft=%s score=%d level=%s analysis=%s",
-                theft, score, risk_level, analysis_text[:100],
+                "supreme_vlm_result person=#%d theft=%s score=%d level=%s analysis=%s",
+                track_id, theft, score, risk_level, analysis_text[:100],
             )
         except Exception as exc:
             logger.warning("supreme_vlm_failed: %s", exc)
             job["analysis"] = fallback
+            job["supreme_vlm_pending"] = False
