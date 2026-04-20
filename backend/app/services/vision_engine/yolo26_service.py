@@ -635,6 +635,10 @@ class Yolo26Service:
         detail = "OK"
         if status == "running" and frames == 0:
             detail = "Waiting for video stream..."
+        alerts = job.get("zone_alerts")
+        alerts_copy = list(alerts) if isinstance(alerts, list) else []
+        if isinstance(alerts, list) and alerts:
+            alerts.clear()
         return {
             "status": status,
             "frames": frames,
@@ -648,11 +652,8 @@ class Yolo26Service:
             "detail": detail,
             "logic": job.get("logic"),
             "analysis": job.get("analysis"),
-            "zone_alerts": list(job.get("zone_alerts", [])),
+            "zone_alerts": alerts_copy,
         }
-        alerts = job.get("zone_alerts")
-        if isinstance(alerts, list) and alerts:
-            alerts.clear()
 
     def _is_stopped(self, job: dict[str, object]) -> bool:
         stop_event = job.get("stop_event")
@@ -1310,6 +1311,20 @@ class Yolo26Service:
 
         suspects = self._supreme_find_suspects(detections)
         suspect_ids = {s["track_id"] for s in suspects}
+
+        # If no suspects are found (no person near stealable items),
+        # provide a default analysis so the frontend always has something to show.
+        if not suspects and job.get("analysis") is None:
+            job["analysis"] = {
+                "risk_score": 0,
+                "risk_score_raw": 0,
+                "risk_level": "LOW",
+                "label": "Normal Activity",
+                "explanation": "No suspects detected near merchandise. Supreme VLM is on standby.",
+                "theft_detected": False,
+                "confidence_score": 0,
+                "mode": "supreme",
+            }
 
         buffers: dict = job.get("supreme_suspects", {})
         interval = config.SUPREME_FRAME_INTERVAL
