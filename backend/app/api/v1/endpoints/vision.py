@@ -92,6 +92,10 @@ class VisionYoutubeRequest(BaseModel):
         default=False,
         description="Supreme OLEYES: bypass LLM, use Pixtral VLM with temporal frame buffer for visual theft detection",
     )
+    vlm_always_on: bool = Field(
+        default=False,
+        description="When Supreme mode is active, always send frames to VLM regardless of merchandise proximity",
+    )
 
 
 class VisionRtspRequest(BaseModel):
@@ -108,6 +112,10 @@ class VisionRtspRequest(BaseModel):
     supreme_mode: bool = Field(
         default=False,
         description="Supreme OLEYES: bypass LLM, use Pixtral VLM with temporal frame buffer for visual theft detection",
+    )
+    vlm_always_on: bool = Field(
+        default=False,
+        description="When Supreme mode is active, always send frames to VLM regardless of merchandise proximity",
     )
 
 
@@ -128,6 +136,10 @@ class VisionRtmpRequest(BaseModel):
     supreme_mode: bool = Field(
         default=False,
         description="Supreme OLEYES: bypass LLM, use Pixtral VLM with temporal frame buffer for visual theft detection",
+    )
+    vlm_always_on: bool = Field(
+        default=False,
+        description="When Supreme mode is active, always send frames to VLM regardless of merchandise proximity",
     )
 
 
@@ -154,6 +166,7 @@ async def start_youtube_detection(
         scene_context=scene_context,
         pose_theft_mode=request.pose_theft_mode,
         supreme_mode=request.supreme_mode,
+        vlm_always_on=request.vlm_always_on,
     )
     background_tasks.add_task(
         _service.start_job, job_id=job_id, source_url=str(request.youtube_url)
@@ -193,6 +206,7 @@ async def start_rtsp_detection(
         security_priorities=priorities or None,
         pose_theft_mode=request.pose_theft_mode,
         supreme_mode=request.supreme_mode,
+        vlm_always_on=request.vlm_always_on,
     )
     background_tasks.add_task(
         _service.start_job, job_id=job_id, source_url=request.rtsp_url
@@ -235,6 +249,7 @@ async def start_rtmp_detection(
         security_priorities=priorities or None,
         pose_theft_mode=request.pose_theft_mode,
         supreme_mode=request.supreme_mode,
+        vlm_always_on=request.vlm_always_on,
     )
     background_tasks.add_task(
         _service.start_job, job_id=job_id, source_url=rtmp_url

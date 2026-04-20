@@ -119,6 +119,7 @@ class Yolo26Service:
         security_priorities: dict[str, bool] | None = None,
         pose_theft_mode: bool = False,
         supreme_mode: bool = False,
+        vlm_always_on: bool = False,
     ) -> None:
         self.stop_all_running()
         self._reset_tracker()
@@ -138,10 +139,10 @@ class Yolo26Service:
         theft_on = sp.get("theft_detection", True)
         self._logic.theft_detection_enabled = theft_on
         self._logic.pose_theft_mode = pose_theft_mode
-        logger.info("security_priorities theft=%s fire=%s fall=%s violence=%s analytics=%s pose_theft=%s supreme=%s",
+        logger.info("security_priorities theft=%s fire=%s fall=%s violence=%s analytics=%s pose_theft=%s supreme=%s vlm_always=%s",
                      theft_on, sp.get("fire_detection"), sp.get("person_fall_detection"),
                      sp.get("violence_detection"), sp.get("customer_behavior_analytics"),
-                     pose_theft_mode, supreme_mode)
+                     pose_theft_mode, supreme_mode, vlm_always_on)
 
         self._jobs[job_id] = {
             "status": "queued",
@@ -150,6 +151,7 @@ class Yolo26Service:
             "stream_protocol": stream_protocol,
             "pose_theft_mode": pose_theft_mode,
             "supreme_mode": supreme_mode,
+            "vlm_always_on": vlm_always_on,
             "zones": zones or {},
             "zone_instructions": zone_instructions or {},
             "security_priorities": sp,
@@ -1310,6 +1312,24 @@ class Yolo26Service:
             return
 
         suspects = self._supreme_find_suspects(detections)
+
+        # VLM Always On: treat ALL persons as suspects, regardless of merchandise proximity
+        if job.get("vlm_always_on") and not suspects:
+            from app.services.vision_engine.logic_engine import COCO_NAMES
+            for det in detections:
+                cls_id = int(det[0])
+                if cls_id == 0:  # person
+                    track_id = int(det[6]) if len(det) >= 7 and det[6] is not None else -1
+                    if track_id == -1:
+                        continue
+                    xyxy = det[2:6]
+                    suspects.append({
+                        "track_id": track_id,
+                        "person_box": xyxy,
+                        "crop_boxes": [xyxy],
+                        "item_labels": ["scene"],
+                    })
+
         suspect_ids = {s["track_id"] for s in suspects}
 
         # If no suspects are found (no person near stealable items),
